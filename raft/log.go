@@ -208,6 +208,40 @@ func (l *raftLog) maybeAppend(prevIdx Index, prevTerm Term, leaderCommit Index, 
 	return lastNewIndex, true, nil
 }
 
+// conflictHint describes, for a rejected AppendEntries, where the follower and
+// the leader stopped agreeing. It implements the §5.3 optimization: instead of
+// the leader backing up one index per round trip, the follower reports the whole
+// term that conflicts, letting the leader skip it in a single step. On a log
+// that diverged for many entries this is the difference between O(entries) round
+// trips and O(terms).
+func (l *raftLog) conflictHint(prevIdx Index) (conflictIndex Index, conflictTerm Term) {
+	// Case 1: we simply do not have an entry there. Tell the leader where our
+	// log actually ends so it can resume from there rather than probing down.
+	if last := l.lastIndex(); prevIdx > last {
+		return last + 1, 0
+	}
+
+	// Case 2: we have an entry but with a different term. Report that term and
+	// the first index at which it appears, so the leader can drop the entire run
+	// in one step.
+	term, err := l.term(prevIdx)
+	if err != nil {
+		// Compacted out from under us. The leader will have to send a snapshot;
+		// point it at our first available index.
+		return l.firstIndex(), 0
+	}
+
+	idx := prevIdx
+	for idx > l.firstIndex() {
+		t, err := l.term(idx - 1)
+		if err != nil || t != term {
+			break
+		}
+		idx--
+	}
+	return idx, term
+}
+
 // ErrSafetyViolation marks a condition that Raft's correctness argument says is
 // unreachable. It is never an expected outcome — seeing it means there is a bug
 // in this implementation, and the right response is to stop, not to recover.

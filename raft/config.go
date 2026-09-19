@@ -144,6 +144,24 @@ func (c Configuration) HasQuorum(granted func(NodeID) bool) bool {
 	return true
 }
 
+// QuorumImpossible reports whether enough nodes have refused that a quorum can
+// no longer be reached, given rejected.
+//
+// This is not the negation of HasQuorum — there is a third state, "still
+// waiting", and conflating it with defeat would make a candidate stand down
+// while votes were still outstanding. Note also the asymmetry with HasQuorum in
+// a joint configuration: winning needs a majority of *both* halves, so a
+// majority refusing in *either* half is already fatal.
+func (c Configuration) QuorumImpossible(rejected func(NodeID) bool) bool {
+	if hasMajority(c.Voters, rejected) {
+		return true
+	}
+	if c.IsJoint() && hasMajority(c.OldVoters, rejected) {
+		return true
+	}
+	return false
+}
+
 func hasMajority(voters []NodeID, granted func(NodeID) bool) bool {
 	if len(voters) == 0 {
 		// An empty half cannot produce a majority. Returning true here would
