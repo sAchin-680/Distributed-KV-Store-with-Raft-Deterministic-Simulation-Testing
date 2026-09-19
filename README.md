@@ -16,9 +16,8 @@ random source, and reproduces any execution exactly.
 When a randomized run finds a safety violation, it prints one number. That number
 is enough for anyone to replay the identical failure, byte for byte, forever.
 
-> **Status:** in active development, built milestone by milestone against explicit
-> exit criteria. The core's foundations — log, configuration, storage contract —
-> are in place; leader election is next. See [Status](#status) for the full plan.
+> **Status:** in active development. Leader election works, with pre-vote; log
+> replication is next. See [Status](#status) for what is built and what is coming.
 
 ```text
                      ┌───────────────────────────────────────────────┐
@@ -128,7 +127,7 @@ make tidy           # sync go.mod / go.sum
 
 ### Simulation
 
-*Available at M4.*
+*Not built yet.*
 
 ```bash
 make fuzz                       # 1,000 seeds (the CI gate)
@@ -141,7 +140,7 @@ bin/simctl fuzz --count=10000 --workers=8
 
 ### Running a cluster
 
-*Available at M5.*
+*Not built yet.*
 
 ```bash
 bin/raftd --id=1 --listen=:9001 --data=./data/1 \
@@ -166,33 +165,33 @@ scripts/      the determinism guards CI runs
 Arriving with the milestones that need them:
 
 ```text
-sim/          deterministic simulator, fault injection, safety checker   (M4)
-storage/      the bbolt Storage implementation                           (M5)
-transport/    Transport interface and its gRPC implementation            (M5)
-clock/        Clock interface, real and virtual                          (M5)
-node/         the driver: one goroutine per node, wiring it all together (M5)
-kvstore/      the replicated state machine                               (M6)
-cmd/          raftd (server), simctl (simulator), kvctl (client)         (M4–M6)
+sim/          deterministic simulator, fault injection, safety checker
+storage/      the bbolt Storage implementation
+transport/    Transport interface and its gRPC implementation
+clock/        Clock interface, real and virtual
+node/         the driver: one goroutine per node, wiring it all together
+kvstore/      the replicated state machine
+cmd/          raftd (server), simctl (simulator), kvctl (client)
 ```
 
 ## Status
 
 Built in milestones, each with an explicit exit criterion rather than a vibe.
 
-| | Milestone | Scope |
-| --- | --- | --- |
-| done | **M0** | Build, codegen, CI, determinism guards |
-| done | **M1** | Core types, log, configuration, storage contract |
-| next | **M2** | Leader election, election restriction, pre-vote |
-| | **M3** | Log replication, log matching, the commit rule |
-| | **M4** | Deterministic simulator, fault injection, safety checker |
-| | **M5** | bbolt storage, gRPC transport, node driver |
-| | **M6** | KV state machine, read-index linearizable reads |
-| | **M7** | Snapshotting and `InstallSnapshot` |
-| | **M8** | Joint-consensus membership changes |
-| | **M9** | Fuzz at scale, with bugs found and documented |
-| | **M10** | `tc`/`netem` chaos, linearizability checking |
-| | **M11–12** | Kubernetes, Terraform, ArgoCD, CI correctness gate |
+| | Component |
+| --- | --- |
+| done | Build tooling, protobuf codegen, CI, determinism guards |
+| done | Core types, the log, cluster configuration, storage contract |
+| done | Leader election — election restriction, pre-vote |
+| next | Log replication — log matching and the commit rule |
+| | Deterministic simulator, fault injection, safety checker |
+| | bbolt storage, gRPC transport, node driver |
+| | KV state machine with read-index linearizable reads |
+| | Snapshotting and `InstallSnapshot` |
+| | Joint-consensus membership changes |
+| | Randomized testing at scale, with bugs found and documented |
+| | `tc`/`netem` chaos and linearizability checking |
+| | Kubernetes, Terraform, ArgoCD, CI correctness gate |
 
 ## Documentation
 
