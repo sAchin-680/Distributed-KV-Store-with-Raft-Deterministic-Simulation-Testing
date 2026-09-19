@@ -274,3 +274,94 @@ func (n *network) terms() []Term {
 }
 
 func maxTerm(terms []Term) Term { return slices.Max(terms) }
+
+// ---------------------------------------------------------------------------
+// Replication helpers
+// ---------------------------------------------------------------------------
+
+// propose submits a command to the given node and runs the network to
+// quiescence.
+func (n *network) propose(id NodeID, cmd string) Index {
+	n.t.Helper()
+	idx, err := n.node(id).Propose([]byte(cmd))
+	if err != nil {
+		n.t.Fatalf("Propose on node %d: %v", id, err)
+	}
+	n.deliver()
+	return idx
+}
+
+// logTerms returns the term of every entry in a node's log, by index.
+func (n *network) logTerms(id NodeID) []Term {
+	n.t.Helper()
+	node := n.node(id)
+	var out []Term
+	for i := node.log.firstIndex(); i <= node.log.lastIndex(); i++ {
+		term, err := node.log.term(i)
+		if err != nil {
+			n.t.Fatalf("term(%d) on node %d: %v", i, id, err)
+		}
+		out = append(out, term)
+	}
+	return out
+}
+
+// committedEntries returns a node's committed prefix.
+func (n *network) committedEntries(id NodeID) []LogEntry {
+	n.t.Helper()
+	node := n.node(id)
+	if node.log.committed == 0 {
+		return nil
+	}
+	ents, err := node.log.entries(node.log.firstIndex(), node.log.committed+1)
+	if err != nil {
+		n.t.Fatalf("reading committed entries of node %d: %v", id, err)
+	}
+	return ents
+}
+
+// requireLogMatching asserts the log matching property across every pair of
+// nodes: if two logs hold the same term at an index, they agree on every entry
+// before it.
+func (n *network) requireLogMatching() {
+	n.t.Helper()
+	for _, a := range n.ids {
+		for _, b := range n.ids {
+			if a >= b {
+				continue
+			}
+			ta, tb := n.logTerms(a), n.logTerms(b)
+			limit := min(len(ta), len(tb))
+			for i := limit - 1; i >= 0; i-- {
+				if ta[i] != tb[i] {
+					continue
+				}
+				// Agreement at index i+1 implies agreement below it.
+				for j := 0; j <= i; j++ {
+					if ta[j] != tb[j] {
+						n.t.Fatalf("log matching violated: nodes %d and %d agree at index %d "+
+							"but differ at index %d (%v vs %v)", a, b, i+1, j+1, ta, tb)
+					}
+				}
+				break
+			}
+		}
+	}
+}
+
+// requireCommittedPrefixesAgree asserts that no two nodes hold a different
+// entry at the same committed index. This is State Machine Safety.
+func (n *network) requireCommittedPrefixesAgree() {
+	n.t.Helper()
+	committed := map[Index]LogEntry{}
+	for _, id := range n.ids {
+		for _, e := range n.committedEntries(id) {
+			prev, seen := committed[e.Index]
+			if seen && (prev.Term != e.Term || string(prev.Command) != string(e.Command)) {
+				n.t.Fatalf("committed entry at index %d differs: %s (term %d) vs %s (term %d)\n%s",
+					e.Index, prev.Command, prev.Term, e.Command, e.Term, n.dump())
+			}
+			committed[e.Index] = e
+		}
+	}
+}

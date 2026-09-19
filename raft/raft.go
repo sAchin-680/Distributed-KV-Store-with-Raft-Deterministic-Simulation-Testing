@@ -58,6 +58,11 @@ type Config struct {
 	// MaxApplyEntries caps how many committed entries are returned at once, so
 	// a large backlog is drained in bounded chunks. Zero means unbounded.
 	MaxApplyEntries int
+
+	// MaxEntriesPerMessage caps how many entries ride in one AppendEntries.
+	// Without a cap, a follower that is far behind provokes a single message
+	// the size of the entire log. Zero uses the default.
+	MaxEntriesPerMessage int
 }
 
 func (c *Config) validate() error {
@@ -405,41 +410,6 @@ func (r *RawNode) tickHeartbeat() error {
 	return nil
 }
 
-// broadcastAppend sends an AppendEntries to every peer.
-//
-// In this milestone every one of them is an empty heartbeat, which is enough to
-// suppress elections and to let a stale leader discover a higher term. Shipping
-// actual entries is the next milestone.
-func (r *RawNode) broadcastAppend() {
-	for _, id := range r.conf.Peers(r.id) {
-		r.sendAppend(id)
-	}
-}
-
-func (r *RawNode) sendAppend(to NodeID) {
-	pr, ok := r.progress[to]
-	if !ok {
-		return
-	}
-
-	prevIndex := pr.Next - 1
-	prevTerm, err := r.log.term(prevIndex)
-	if err != nil {
-		// The entries this peer needs have been compacted away; it needs a
-		// snapshot, which arrives with the snapshotting milestone. Until then,
-		// leave it behind rather than sending something it cannot check.
-		return
-	}
-
-	r.send(Message{
-		Type:         MsgAppendReq,
-		To:           to,
-		PrevLogIndex: prevIndex,
-		PrevLogTerm:  prevTerm,
-		LeaderCommit: r.log.committed,
-	})
-}
-
 // ---------------------------------------------------------------------------
 // Step
 // ---------------------------------------------------------------------------
@@ -533,122 +503,6 @@ func (r *RawNode) dispatch(m Message) error {
 	default:
 		return fmt.Errorf("raft: unhandled message type %s: %w", m.Type, ErrIgnoredMessage)
 	}
-}
-
-// ---------------------------------------------------------------------------
-// AppendEntries
-// ---------------------------------------------------------------------------
-
-func (r *RawNode) handleAppendRequest(m Message) error {
-	// Hearing from the leader of our term is what keeps us from campaigning.
-	r.electionElapsed = 0
-
-	if r.state != Follower {
-		// A leader has been elected in our term, so our campaign is over.
-		r.becomeFollower(m.Term, m.From)
-	}
-	r.lead = m.From
-
-	lastNew, ok, err := r.log.maybeAppend(m.PrevLogIndex, m.PrevLogTerm, m.LeaderCommit, m.Entries)
-	if err != nil {
-		return err
-	}
-
-	if !ok {
-		ci, ct := r.log.conflictHint(m.PrevLogIndex)
-		r.send(Message{
-			Type:          MsgAppendResp,
-			To:            m.From,
-			Success:       false,
-			ConflictIndex: ci,
-			ConflictTerm:  ct,
-			ReadID:        m.ReadID,
-		})
-		return nil
-	}
-
-	// Persist before the acknowledgement leaves: it is a claim that these
-	// entries are durable here.
-	if err := r.persistHardState(); err != nil {
-		return err
-	}
-	r.send(Message{
-		Type:       MsgAppendResp,
-		To:         m.From,
-		Success:    true,
-		MatchIndex: lastNew,
-		ReadID:     m.ReadID,
-	})
-	return nil
-}
-
-func (r *RawNode) handleAppendResponse(m Message) error {
-	if r.state != Leader {
-		return fmt.Errorf("raft: append response to non-leader: %w", ErrIgnoredMessage)
-	}
-	pr, ok := r.progress[m.From]
-	if !ok {
-		return fmt.Errorf("raft: append response from untracked peer %d: %w", m.From, ErrIgnoredMessage)
-	}
-
-	if m.Success {
-		// Take the follower's word for how far it matches rather than assuming
-		// what we sent arrived. Responses can be delayed, reordered and
-		// duplicated, and Match must never move backwards.
-		if m.MatchIndex > pr.Match {
-			pr.Match = m.MatchIndex
-			pr.Next = pr.Match + 1
-		}
-		return nil
-	}
-
-	// Rejected: back up and retry. This loop is what enforces the log matching
-	// property. The conflict hint lets us skip a whole term at a time instead of
-	// one index per round trip.
-	var next Index
-	switch {
-	case m.ConflictTerm > 0:
-		// Resume from just past our own last entry in the conflicting term if we
-		// have one; otherwise from where the follower says that term begins.
-		if idx, found := r.lastIndexOfTerm(m.ConflictTerm); found {
-			next = idx + 1
-		} else {
-			next = m.ConflictIndex
-		}
-	case m.ConflictIndex > 0:
-		next = m.ConflictIndex
-	default:
-		next = pr.Next - 1
-	}
-
-	if next < 1 {
-		next = 1
-	}
-	if next < pr.Next {
-		pr.Next = next
-		r.sendAppend(m.From)
-	}
-	return nil
-}
-
-// lastIndexOfTerm finds our own last entry in the given term, walking back from
-// the end of the log.
-func (r *RawNode) lastIndexOfTerm(term Term) (Index, bool) {
-	for i := r.log.lastIndex(); i >= r.log.firstIndex() && i > 0; i-- {
-		t, err := r.log.term(i)
-		if err != nil {
-			return 0, false
-		}
-		if t == term {
-			return i, true
-		}
-		if t < term {
-			// Terms are non-decreasing along the log, so once we are below the
-			// term we are looking for, it is not there.
-			return 0, false
-		}
-	}
-	return 0, false
 }
 
 func (r *RawNode) String() string {
