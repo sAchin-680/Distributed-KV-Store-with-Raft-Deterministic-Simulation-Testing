@@ -17,8 +17,9 @@ When a randomized run finds a safety violation, it prints one number. That numbe
 is enough for anyone to replay the identical failure, byte for byte, forever.
 
 > **Status:** in active development. Consensus works — leader election with
-> pre-vote, log replication, and the current-term commit rule. The deterministic
-> simulator is next. See [Status](#status) for what is built and what is coming.
+> pre-vote, log replication and the current-term commit rule — and is verified by
+> the deterministic simulator below. Real gRPC and disk storage come next. See
+> [Status](#status) for what is built and what is coming.
 
 ```text
                      ┌───────────────────────────────────────────────┐
@@ -70,6 +71,63 @@ Four layers, each catching what the others structurally cannot.
 The simulator proves the *algorithm* under adversarial scheduling. The chaos rig
 proves the *implementation* under real gRPC deadlines, real fsyncs and real OS
 scheduling. Neither is redundant; each covers the other's blind spot.
+
+## The simulation campaign
+
+```
+$ simctl fuzz --count=10000
+fuzzing seeds 1..10000 across 12 workers (5 nodes, 30000ms virtual each)
+ran 10000 seeds in 4m2.867s (41 seeds/sec, 13535461 entries committed,
+                             2092853788 events)
+no safety violations
+```
+
+| | |
+| --- | --- |
+| Seeds | 10,000 |
+| Simulated events | 2,092,853,788 |
+| Entries committed | 13,535,461 |
+| Cluster time simulated | **83.3 hours in 4 minutes** — 1,235× real time |
+| Safety violations | **0** |
+
+Checked after every single event: at most one leader per term, no committed entry
+ever changes, commit index never decreases, applied never exceeds committed. At
+the end of each run: log matching pairwise across all nodes, and no two nodes
+having applied a different command at the same position.
+
+### One integer reproduces any failure
+
+That is the whole point of building it this way. Three runs of the same seed:
+
+```
+284481 events, 12633ms virtual, trace 39e3e8aef5e8191d
+284481 events, 12633ms virtual, trace 39e3e8aef5e8191d
+284481 events, 12633ms virtual, trace 39e3e8aef5e8191d
+
+safety violation [committed-entries-never-change] at t=12633ms (seed 2):
+  committed index 157 changed: node 4 committed term 1 (bca6269a) at t=3255ms,
+  node 1 now has term 2 (da3a08fa)
+```
+
+Identical event count, identical trace hash, identical violation at the same
+index and the same millisecond — on any machine, indefinitely. A randomized test
+that cannot do this reports failures nobody can act on.
+
+### The checker is validated against a real violation
+
+Ten thousand clean runs prove nothing until the instrument is shown to detect
+what it is looking for. A checker that never fires is indistinguishable from a
+broken one.
+
+Raft's safety argument assumes a node's term and vote survive a crash.
+`--disk-loss` removes that assumption, which *must* produce two leaders in a term
+and therefore overwritten committed entries. It does — **7 failing seeds out of
+41** — caught two independent ways: the simulator's checker spotting a changed
+committed entry, and the core's own append path refusing to overwrite its
+committed prefix.
+
+Those are not implementation bugs. They are the predicted consequence of breaking
+a documented assumption, used as a control.
 
 ## Measured
 
@@ -172,15 +230,19 @@ make tidy           # sync go.mod / go.sum
 
 ### Simulation
 
-*Not built yet.*
-
 ```bash
 make fuzz                       # 1,000 seeds (the CI gate)
-make fuzz FUZZ_SEEDS=10000      # a real run
+make fuzz FUZZ_SEEDS=10000      # the full campaign
 make replay SEED=12345          # reproduce one exact execution
 
 bin/simctl run  --seed=12345 --verbose
 bin/simctl fuzz --count=10000 --workers=8
+
+# tell an algorithm bug from a fault-handling one
+bin/simctl run --seed=12345 --no-faults
+
+# the negative control: break Raft's durability assumption on purpose
+bin/simctl fuzz --count=200 --disk-loss=0.5
 ```
 
 ### Running a cluster
@@ -202,21 +264,22 @@ Present today:
 
 ```text
 raft/         the consensus core — pure, deterministic, no I/O and no goroutines
+sim/          deterministic simulator, fault injection, safety checker
+cmd/simctl/   the simulation CLI
 proto/        protobuf definitions and generated code
 docs/         architecture notes and decision records
-scripts/      the determinism guards CI runs
+scripts/      determinism guards and the mutation suite
 ```
 
 Arriving with the milestones that need them:
 
 ```text
-sim/          deterministic simulator, fault injection, safety checker
 storage/      the bbolt Storage implementation
 transport/    Transport interface and its gRPC implementation
 clock/        Clock interface, real and virtual
 node/         the driver: one goroutine per node, wiring it all together
 kvstore/      the replicated state machine
-cmd/          raftd (server), simctl (simulator), kvctl (client)
+cmd/          raftd (server), kvctl (client)
 ```
 
 ## Status
@@ -229,8 +292,8 @@ Built in milestones, each with an explicit exit criterion rather than a vibe.
 | done | Core types, the log, cluster configuration, storage contract |
 | done | Leader election — election restriction, pre-vote |
 | done | Log replication — log matching and the commit rule |
-| next | Deterministic simulator, fault injection, safety checker |
-| | bbolt storage, gRPC transport, node driver |
+| done | Deterministic simulator, fault injection, safety checker, `simctl` |
+| next | bbolt storage, gRPC transport, node driver |
 | | KV state machine with read-index linearizable reads |
 | | Snapshotting and `InstallSnapshot` |
 | | Joint-consensus membership changes |

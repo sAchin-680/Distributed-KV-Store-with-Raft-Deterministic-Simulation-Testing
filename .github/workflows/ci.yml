@@ -109,17 +109,24 @@ jobs:
   # with `make replay SEED=...`. This is the step that makes the simulation
   # framework load-bearing rather than decorative.
   # ---------------------------------------------------------------------------
-  # Enabled once the simulator lands. Left here, commented, so the gate is
-  # a visible part of the pipeline's design rather than an afterthought.
-  #
-  # simulation:
-  #   name: Simulation fuzz gate
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: actions/setup-go@v5
-  #       with:
-  #         go-version: ${{ env.GO_VERSION }}
-  #         cache: true
-  #     - name: Fuzz the simulator
-  #       run: make fuzz FUZZ_SEEDS=1000
+  simulation:
+    name: Simulation fuzz gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      # Randomized runs of a whole cluster under message loss, reordering,
+      # duplication, partitions and crashes, with Raft's safety properties
+      # asserted after every event. Any failing seed fails the build, and the
+      # seed alone reproduces the failure exactly:
+      #
+      #     make replay SEED=<the seed>
+      #
+      # Bounded here to keep the pull-request gate honest about its own runtime.
+      - name: Fuzz the simulator
+        run: make fuzz FUZZ_SEEDS=1000

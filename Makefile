@@ -121,20 +121,13 @@ cover: ## Run tests and open an HTML coverage report
 FUZZ_SEEDS ?= 1000
 
 .PHONY: fuzz
-fuzz: require-simctl ## Run the deterministic simulation fuzz suite (FUZZ_SEEDS=N)
-	@$(MAKE) --no-print-directory $(BIN)/simctl
-	$(BIN)/simctl fuzz --count=$(FUZZ_SEEDS)
+fuzz: $(BIN)/simctl ## Run the simulation fuzz suite (FUZZ_SEEDS=N)
+	$(BIN)/simctl fuzz --count=$(FUZZ_SEEDS) --quiet
 
 .PHONY: replay
-replay: require-simctl ## Replay one simulation seed (SEED=N)
+replay: $(BIN)/simctl ## Replay one simulation seed exactly (SEED=N)
 	@[ -n "$(SEED)" ] || { echo "usage: make replay SEED=12345"; exit 2; }
-	@$(MAKE) --no-print-directory $(BIN)/simctl
 	$(BIN)/simctl run --seed=$(SEED) --verbose
-
-.PHONY: require-simctl
-require-simctl:
-	@[ -n "$(wildcard cmd/simctl/*.go)" ] || \
-		{ echo "the simulator has not been built yet"; exit 2; }
 
 ## ---------------------------------------------------------------------------
 ## Static analysis
