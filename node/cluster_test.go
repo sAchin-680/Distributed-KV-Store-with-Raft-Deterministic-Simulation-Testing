@@ -550,3 +550,112 @@ func TestNodeRecoversFromDiskAfterRestart(t *testing.T) {
 		t.Error("the restarted node came back at term 0; its persisted term was lost")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Linearizable reads
+// ---------------------------------------------------------------------------
+
+func TestLinearizableReadSeesEveryCompletedWrite(t *testing.T) {
+	c := newCluster(t, 3)
+	leader, _ := c.awaitLeader(15 * time.Second)
+
+	for i := range 10 {
+		if err := c.set(leader, fmt.Sprintf("k-%d", i), fmt.Sprintf("v-%d", i)); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+
+		// Every write that has returned must be visible to a read that starts
+		// afterwards. That is the whole of linearizability for this pair.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		var got []byte
+		err := c.nodes[leader].LinearizableRead(ctx, func() error {
+			v, ok := c.kv[leader].Get(fmt.Appendf(nil, "k-%d", i))
+			if !ok {
+				return fmt.Errorf("key k-%d is missing", i)
+			}
+			got = v
+			return nil
+		})
+		cancel()
+		if err != nil {
+			t.Fatalf("read after write %d: %v", i, err)
+		}
+		if want := fmt.Sprintf("v-%d", i); string(got) != want {
+			t.Fatalf("read %q, want %q", got, want)
+		}
+	}
+}
+
+func TestReadIndexIsRefusedOnAFollower(t *testing.T) {
+	c := newCluster(t, 3)
+	leader, _ := c.awaitLeader(15 * time.Second)
+
+	for _, id := range c.ids {
+		if id == leader {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_, err := c.nodes[id].ReadIndex(ctx)
+		cancel()
+		if err == nil {
+			t.Errorf("follower %d served a read barrier; only a leader can "+
+				"confirm one, and a follower's state machine can be arbitrarily "+
+				"far behind", id)
+		}
+	}
+}
+
+// A leader cut off from its cluster must refuse reads rather than serve stale
+// data. This is the failure the read barrier exists for, over a real network.
+func TestPartitionedLeaderRefusesReads(t *testing.T) {
+	c := newCluster(t, 3)
+	leader, _ := c.awaitLeader(15 * time.Second)
+
+	if err := c.set(leader, "k", "v"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// Take the other two away. The leader does not know yet.
+	for _, id := range c.ids {
+		if id != leader {
+			c.shutdown(id)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, err := c.nodes[leader].ReadIndex(ctx)
+	if err == nil {
+		t.Fatal("a leader with no reachable peers confirmed a read; it cannot " +
+			"know whether another leader has committed writes it has never seen")
+	}
+
+	// A local read still answers — which is exactly why it is not the one to
+	// serve clients from.
+	if _, ok := c.kv[leader].Get([]byte("k")); !ok {
+		t.Error("setup: the key should still be in the local state machine")
+	}
+}
+
+func TestReadsWorkOnASingleNodeCluster(t *testing.T) {
+	c := newCluster(t, 1)
+	leader, _ := c.awaitLeader(10 * time.Second)
+
+	if err := c.set(leader, "solo", "value"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// One node is its own quorum, so this needs no round trip at all — but it
+	// still has to work, and an earlier version of the core never committed the
+	// leader's no-op here, so reads were refused forever on a healthy cluster.
+	index, err := c.nodes[leader].ReadIndex(ctx)
+	if err != nil {
+		t.Fatalf("ReadIndex on a single-node cluster: %v", err)
+	}
+	if index == 0 {
+		t.Error("read index is 0; the leader's no-op never committed")
+	}
+}

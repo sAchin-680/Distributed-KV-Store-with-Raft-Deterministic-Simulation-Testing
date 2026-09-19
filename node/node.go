@@ -161,9 +161,12 @@ type Node struct {
 
 	proposeCh chan *proposal
 	statusCh  chan chan Status
+	readCh    chan *readRequest
 
-	// pending is owned by run() too.
-	pending map[raft.Index]awaiting
+	// pending and pendingReads are owned by run() too.
+	pending      map[raft.Index]awaiting
+	pendingReads map[uint64]*readRequest
+	readSeq      uint64
 
 	// lastState and lastTerm detect leadership changes between iterations.
 	lastState raft.State
@@ -204,16 +207,18 @@ func Start(cfg Config) (*Node, error) {
 	}
 
 	n := &Node{
-		cfg:       cfg,
-		log:       cfg.Logger.With("component", "node", "node", uint64(cfg.ID)),
-		rn:        rn,
-		proposeCh: make(chan *proposal, cfg.ProposeBuffer),
-		statusCh:  make(chan chan Status),
-		pending:   make(map[raft.Index]awaiting),
-		lastState: rn.State(),
-		lastTerm:  rn.Term(),
-		stopCh:    make(chan struct{}),
-		doneCh:    make(chan struct{}),
+		cfg:          cfg,
+		log:          cfg.Logger.With("component", "node", "node", uint64(cfg.ID)),
+		rn:           rn,
+		proposeCh:    make(chan *proposal, cfg.ProposeBuffer),
+		statusCh:     make(chan chan Status),
+		readCh:       make(chan *readRequest, cfg.ProposeBuffer),
+		pending:      make(map[raft.Index]awaiting),
+		pendingReads: make(map[uint64]*readRequest),
+		lastState:    rn.State(),
+		lastTerm:     rn.Term(),
+		stopCh:       make(chan struct{}),
+		doneCh:       make(chan struct{}),
 	}
 
 	go n.run()
@@ -253,6 +258,7 @@ func (n *Node) run() {
 		select {
 		case <-n.stopCh:
 			n.failPending(ErrStopped)
+			n.failReads(ErrStopped)
 			n.log.Info("node stopped")
 			return
 
@@ -267,6 +273,7 @@ func (n *Node) run() {
 				// The transport closed underneath us; there is nothing left to
 				// drive this node.
 				n.failPending(ErrStopped)
+				n.failReads(ErrStopped)
 				n.log.Info("transport closed, stopping")
 				return
 			}
@@ -277,6 +284,9 @@ func (n *Node) run() {
 
 		case p := <-n.proposeCh:
 			n.handlePropose(p)
+
+		case req := <-n.readCh:
+			n.handleRead(req)
 
 		case reply := <-n.statusCh:
 			reply <- n.statusLocked()
@@ -296,6 +306,8 @@ func (n *Node) flush() error {
 		n.cfg.Transport.Send(m)
 	}
 
+	n.resolveReads()
+
 	if err := n.applyCommitted(); err != nil {
 		return err
 	}
@@ -305,6 +317,7 @@ func (n *Node) flush() error {
 	if state := n.rn.State(); state != n.lastState || n.rn.Term() != n.lastTerm {
 		if n.lastState == raft.Leader && state != raft.Leader {
 			n.failPending(ErrProposalDropped)
+			n.failReads(ErrNotLeader)
 		}
 		n.log.Info("state change",
 			"from", n.lastState.String(), "to", state.String(),
@@ -380,7 +393,9 @@ func (n *Node) failPending(err error) {
 // being gone, and does not tolerate one lying.
 func (n *Node) fatal(during string, err error) {
 	n.log.Error("node failed, stopping", "during", during, "error", err)
-	n.failPending(fmt.Errorf("node: failed during %s: %w", during, err))
+	wrapped := fmt.Errorf("node: failed during %s: %w", during, err)
+	n.failPending(wrapped)
+	n.failReads(wrapped)
 }
 
 // ---------------------------------------------------------------------------
