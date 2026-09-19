@@ -43,9 +43,14 @@ jobs:
       - name: Determinism guards
         run: ./scripts/check-determinism.sh
 
-      - uses: golangci/golangci-lint-action@v6
+      # v8 is the action major that matches the v2 config schema in
+      # .golangci.yml. The version is pinned rather than "latest" because
+      # golangci-lint refuses to run when the Go version it was built with is
+      # older than the one this module targets, so "latest" can break the build
+      # on a release that has nothing to do with this repository.
+      - uses: golangci/golangci-lint-action@v8
         with:
-          version: latest
+          version: v2.5.0
 
   # ---------------------------------------------------------------------------
   # Generated code must match the .proto files it came from.
