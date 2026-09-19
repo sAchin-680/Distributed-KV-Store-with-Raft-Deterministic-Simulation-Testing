@@ -16,9 +16,9 @@ random source, and reproduces any execution exactly.
 When a randomized run finds a safety violation, it prints one number. That number
 is enough for anyone to replay the identical failure, byte for byte, forever.
 
-> **Status:** in active development. Consensus works — leader election with
-> pre-vote, log replication and the current-term commit rule — and is verified by
-> the deterministic simulator below. Real gRPC and disk storage come next. See
+> **Status:** in active development. The store works end to end — a real cluster
+> elects a leader, replicates writes to durable storage, and serves linearizable
+> reads to clients over gRPC. Snapshotting and membership changes come next. See
 > [Status](#status) for what is built and what is coming.
 
 ```text
@@ -142,7 +142,7 @@ runs. Reproduce with `make bench` and `make mutation`.
 | Commit round, 5-node cluster | 3.13 µs — **320k commits/sec** |
 | Steady-state heartbeat, 3-node | 595 ns |
 | Leader election from cold start | **12.1 logical ticks** median |
-| Seeded bugs caught by the test suite | **10 / 10** |
+| Seeded bugs caught by the test suite | **14 / 14** |
 | Statement coverage of the core | 76.5% |
 | Test-to-code ratio | 0.98 : 1 |
 
@@ -161,7 +161,7 @@ both ways:
 
 ### Mutation testing
 
-`make mutation` seeds ten known Raft bugs — the classic ones, including Figure 8
+`make mutation` seeds fourteen known Raft bugs — the classic ones, including Figure 8
 and index-first log comparison — and checks that the test named after each one
 actually fails. It runs in 2.2 s and gates CI.
 
@@ -247,39 +247,49 @@ bin/simctl fuzz --count=200 --disk-loss=0.5
 
 ### Running a cluster
 
-*Not built yet.*
-
 ```bash
-bin/raftd --id=1 --listen=:9001 --data=./data/1 \
-          --peers=1@localhost:9001,2@localhost:9002,3@localhost:9003
+# Peer traffic and client traffic get separate ports, so a flood of client
+# requests cannot starve the heartbeats that keep the leader in office.
+for i in 1 2 3; do
+  bin/raftd --id=$i --listen=127.0.0.1:900$i --client-listen=127.0.0.1:800$i \
+            --data=./data/$i --tick=50ms \
+            --peers=1@127.0.0.1:9001,2@127.0.0.1:9002,3@127.0.0.1:9003 &
+done
 
-bin/kvctl --endpoints=localhost:9001,localhost:9002,localhost:9003 set foo bar
-bin/kvctl get foo
-bin/kvctl status
+E=127.0.0.1:8001,127.0.0.1:8002,127.0.0.1:8003
+bin/kvctl --endpoints=$E status
+bin/kvctl --endpoints=$E set greeting "hello world"
+bin/kvctl --endpoints=$E get greeting
+bin/kvctl --endpoints=$E --stale get greeting   # skips the leadership check
+bin/kvctl --endpoints=$E delete greeting
+```
+
+`kvctl` is given the whole cluster, not one node. Leadership moves on its own
+schedule, so it follows the redirect and remembers where it ended up.
+
+```text
+ENDPOINT         NODE  STATE     TERM  LEADER  COMMIT  APPLIED  LAG
+127.0.0.1:8001   1     follower  1     3       1       1        -
+127.0.0.1:8002   2     follower  1     3       1       1        -
+127.0.0.1:8003   3     leader    1     3       1       1        0
 ```
 
 ## Project layout
 
-Present today:
-
 ```text
 raft/         the consensus core — pure, deterministic, no I/O and no goroutines
 sim/          deterministic simulator, fault injection, safety checker
-cmd/simctl/   the simulation CLI
+node/         the driver: one goroutine per node, owning all Raft state
+storage/      durable bbolt storage
+transport/    peer transport: the interface and its gRPC implementation
+clock/        Clock interface, real and fake
+kvstore/      the replicated state machine, with client-session deduplication
+kvserver/     the client-facing gRPC API and a cluster-aware client
+codec/        conversion between core types and protobuf
 proto/        protobuf definitions and generated code
+cmd/          raftd, kvctl, simctl
 docs/         architecture notes and decision records
 scripts/      determinism guards and the mutation suite
-```
-
-Arriving with the milestones that need them:
-
-```text
-storage/      the bbolt Storage implementation
-transport/    Transport interface and its gRPC implementation
-clock/        Clock interface, real and virtual
-node/         the driver: one goroutine per node, wiring it all together
-kvstore/      the replicated state machine
-cmd/          raftd (server), kvctl (client)
 ```
 
 ## Status
@@ -288,14 +298,14 @@ Built in milestones, each with an explicit exit criterion rather than a vibe.
 
 | | Component |
 | --- | --- |
-| done | Build tooling, protobuf codegen, CI, determinism guards |
+| done | Build tooling, protobuf codegen, CI, determinism guards, mutation gate |
 | done | Core types, the log, cluster configuration, storage contract |
 | done | Leader election — election restriction, pre-vote |
 | done | Log replication — log matching and the commit rule |
 | done | Deterministic simulator, fault injection, safety checker, `simctl` |
-| next | bbolt storage, gRPC transport, node driver |
-| | KV state machine with read-index linearizable reads |
-| | Snapshotting and `InstallSnapshot` |
+| done | bbolt storage, gRPC transport, node driver, `raftd` |
+| done | KV state machine, read-index linearizable reads, client API, `kvctl` |
+| next | Snapshotting and `InstallSnapshot` |
 | | Joint-consensus membership changes |
 | | Randomized testing at scale, with bugs found and documented |
 | | `tc`/`netem` chaos and linearizability checking |
@@ -304,7 +314,9 @@ Built in milestones, each with an explicit exit criterion rather than a vibe.
 ## Documentation
 
 - [Architecture](docs/architecture.md) — package layout and the pure-core design
-- `docs/adr/` — architecture decision records
+- [ADR-0001](docs/adr/0001-pure-deterministic-core.md) — why the consensus core has no clock, I/O or goroutines
+- [ADR-0002](docs/adr/0002-synchronous-persistence.md) — what fsync costs, measured, and the ceiling it sets
+- [ADR-0003](docs/adr/0003-read-index.md) — why the obvious read is wrong, and why not a leader lease
 
 ## References
 
