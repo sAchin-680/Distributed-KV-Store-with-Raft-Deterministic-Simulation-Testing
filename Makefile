@@ -40,9 +40,17 @@ build: $(addprefix $(BIN)/,$(CMDS)) ## Build all binaries into ./bin
 		echo "built: $(CMDS)"; \
 	fi
 
-$(BIN)/%:
+# FORCE, because these targets have no prerequisites and make would otherwise
+# consider an existing binary up to date and skip the build entirely — handing
+# back a stale binary with no indication anything was wrong. Go's build cache
+# makes an unnecessary rebuild nearly free, so always asking is the cheap and
+# correct option.
+$(BIN)/%: FORCE
 	@mkdir -p $(BIN)
 	$(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $@ ./cmd/$*
+
+.PHONY: FORCE
+FORCE:
 
 .PHONY: clean
 clean: ## Remove build and test artifacts
