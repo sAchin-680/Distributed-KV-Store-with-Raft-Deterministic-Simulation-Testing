@@ -51,8 +51,17 @@ class Mutation:
     expect: str
     """Go test name pattern that must fail once the mutation is applied."""
 
+
     why: str
     """What breaks in a real cluster if this mutation ships."""
+
+    pkg: str = "./raft/"
+    """Package holding that test.
+
+    Needed because `go test -run` exits 0 when the pattern matches nothing, so
+    pointing at the wrong package reports every mutation as surviving. That is
+    exactly what happened the first time a mutation outside the core was added.
+    """
 
 
 MUTATIONS: list[Mutation] = [
@@ -188,13 +197,40 @@ MUTATIONS: list[Mutation] = [
         why="A new leader's commit index understates what the cluster has "
         "committed, so the read can miss a write that already completed.",
     ),
+    Mutation(
+        name="session/retries-are-applied-twice",
+        file="kvstore/kvstore.go",
+        pkg="./kvstore/",
+        old="""	if result, duplicate := s.checkSession(cmd.ClientID, cmd.Sequence); duplicate {""",
+        new="""	if result, duplicate := s.checkSession(cmd.ClientID, cmd.Sequence); false {
+		_ = result""",
+        expect="TestRetriedWriteIsAppliedOnce|TestRetriedDeleteReplaysItsOriginalAnswer",
+        why="Raft applies at least once, so a retried write lands twice. The map "
+        "still looks right; the client-visible history does not, and that is what "
+        "a linearizability checker reads.",
+    ),
+    Mutation(
+        name="session/eviction-is-not-deterministic",
+        file="kvstore/session.go",
+        pkg="./kvstore/",
+        old="""	slices.SortFunc(candidates, func(a, b candidate) int {
+		if c := cmp.Compare(a.index, b.index); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.id, b.id)
+	})""",
+        new="""	_ = cmp.Compare[uint64]""",
+        expect="TestSessionEvictionIsDeterministic",
+        why="Nodes evict different sessions, so replicas diverge silently and only "
+        "visibly much later.",
+    ),
 ]
 
 
-def run_tests(pattern: str) -> bool:
+def run_tests(pattern: str, pkg: str = "./raft/") -> bool:
     """Return True if the test run passed."""
     result = subprocess.run(
-        ["go", "test", "./raft/", "-count=1", "-run", pattern],
+        ["go", "test", pkg, "-count=1", "-run", pattern],
         cwd=ROOT,
         capture_output=True,
         text=True,
@@ -222,9 +258,21 @@ def main() -> int:
     selected.sort(key=lambda m: m.name)
 
     # Confirm the suite is green first, or every result below is meaningless.
-    if not run_tests("."):
+    if not run_tests(".", "./..."):
         print(f"{RED}the test suite fails before any mutation; fix that first{RESET}")
         return 2
+
+    # A pattern that matches no test makes `go test` exit 0, which would report
+    # the mutation as surviving for a reason that has nothing to do with the
+    # code. Check up front that every expectation actually names a test.
+    for m in selected:
+        listed = subprocess.run(
+            ["go", "test", m.pkg, "-run", m.expect, "-list", m.expect],
+            cwd=ROOT, capture_output=True, text=True,
+        )
+        if not any(line.startswith("Test") for line in listed.stdout.splitlines()):
+            print(f"{RED}{m.name}: no test in {m.pkg} matches {m.expect!r}{RESET}")
+            return 2
 
     caught, survived = 0, []
     area = None
@@ -242,7 +290,7 @@ def main() -> int:
 
         path.write_text(original.replace(m.old, m.new, 1), encoding="utf-8")
         try:
-            passed = run_tests(m.expect)
+            passed = run_tests(m.expect, m.pkg)
         finally:
             path.write_text(original, encoding="utf-8")
 

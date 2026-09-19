@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/sAchin-680/raftkv/internal/buildinfo"
+	"github.com/sAchin-680/raftkv/kvserver"
 	"github.com/sAchin-680/raftkv/kvstore"
 	"github.com/sAchin-680/raftkv/node"
 	"github.com/sAchin-680/raftkv/raft"
@@ -42,6 +43,7 @@ func main() {
 type options struct {
 	id            uint64
 	listen        string
+	clientListen  string
 	dataDir       string
 	peers         string
 	tickInterval  time.Duration
@@ -58,6 +60,10 @@ func run() error {
 	var o options
 	flag.Uint64Var(&o.id, "id", 0, "this node's identity (required, non-zero)")
 	flag.StringVar(&o.listen, "listen", ":9001", "address to serve peer traffic on")
+	flag.StringVar(&o.clientListen, "client-listen", "",
+		"address to serve the client API on (empty disables it)\n"+
+			"\tKept separate from --listen so a flood of client traffic cannot\n"+
+			"\tstarve the heartbeats that keep the leader in office.")
 	flag.StringVar(&o.dataDir, "data", "", "directory for durable state (required)")
 	flag.StringVar(&o.peers, "peers", "", "every node as id@address, comma separated (required)")
 	flag.DurationVar(&o.tickInterval, "tick", 100*time.Millisecond, "real time per logical tick")
@@ -132,9 +138,20 @@ func run() error {
 		return err
 	}
 
+	var clientAPI *kvserver.Server
+	if o.clientListen != "" {
+		clientAPI, err = kvserver.Serve(kvserver.Config{
+			Node: n, Store: store, Listen: o.clientListen, Peers: peers, Logger: logger,
+		})
+		if err != nil {
+			return err
+		}
+	}
+
 	log.Info("raftd running",
 		"version", buildinfo.Version,
 		"listen", tr.Addr(),
+		"client_listen", o.clientListen,
 		"data", dbPath,
 		"peers", len(peers),
 		"election_timeout", time.Duration(o.electionTick)*o.tickInterval)
@@ -153,10 +170,13 @@ func run() error {
 		log.Warn("node stopped on its own")
 	}
 
-	// Order matters, and it is the reverse of startup. The node's run loop reads
-	// from the transport, so stopping the node first lets it exit on its own
-	// signal rather than on a closed channel — and it flushes any work in flight
-	// before the sockets disappear.
+	// Order matters, and it is the reverse of startup. Clients are turned away
+	// first so none are left waiting on a node that is about to stop. The node's
+	// run loop reads from the transport, so stopping the node before the
+	// transport lets it exit on its own signal rather than on a closed channel.
+	if clientAPI != nil {
+		clientAPI.Stop()
+	}
 	n.Stop()
 	if err := tr.Close(); err != nil {
 		log.Error("closing transport", "error", err)
