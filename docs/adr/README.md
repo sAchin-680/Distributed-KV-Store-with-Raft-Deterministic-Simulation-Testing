@@ -8,8 +8,8 @@ never edited afterwards except to mark it superseded.
 | ADR | Decision | Status |
 | --- | --- | --- |
 | [0001](0001-pure-deterministic-core.md) | The consensus core is a pure state machine with no clock, I/O or goroutines | Accepted |
-| 0002 | Read-index rather than naive leader reads | Planned |
-| 0003 | Synchronous persistence in the core, giving up batching | Planned |
+| [0002](0002-synchronous-persistence.md) | Persist synchronously in the core, accepting a measured ~125 writes/sec ceiling | Accepted |
+| 0003 | Read-index rather than naive leader reads | Planned |
 | 0004 | StatefulSet rather than Deployment | Planned |
 
 ## Format
