@@ -104,7 +104,7 @@ jobs:
   # with `make replay SEED=...`. This is the step that makes the simulation
   # framework load-bearing rather than decorative.
   # ---------------------------------------------------------------------------
-  # Enabled once the simulator lands (M4). Left here, commented, so the gate is
+  # Enabled once the simulator lands. Left here, commented, so the gate is
   # a visible part of the pipeline's design rather than an afterthought.
   #
   # simulation:

@@ -35,7 +35,7 @@ GOLANGCILINT_VERSION    := v2.5.0
 .PHONY: build
 build: $(addprefix $(BIN)/,$(CMDS)) ## Build all binaries into ./bin
 	@if [ -z "$(CMDS)" ]; then \
-		echo "no commands to build yet (raftd lands at M5, simctl at M4)"; \
+		echo "no command packages yet"; \
 	else \
 		echo "built: $(CMDS)"; \
 	fi
@@ -123,7 +123,7 @@ replay: require-simctl ## Replay one simulation seed (SEED=N)
 .PHONY: require-simctl
 require-simctl:
 	@[ -n "$(wildcard cmd/simctl/*.go)" ] || \
-		{ echo "the simulator is not built yet — it lands at M4"; exit 2; }
+		{ echo "the simulator has not been built yet"; exit 2; }
 
 ## ---------------------------------------------------------------------------
 ## Static analysis
@@ -191,7 +191,7 @@ TAG   ?= $(COMMIT)
 
 .PHONY: docker
 docker: ## Build the production container image
-	@[ -f Dockerfile ] || { echo "no Dockerfile yet — packaging lands at M11"; exit 2; }
+	@[ -f Dockerfile ] || { echo "no Dockerfile yet"; exit 2; }
 	docker build -t $(IMAGE):$(TAG) -t $(IMAGE):latest .
 
 ## ---------------------------------------------------------------------------
