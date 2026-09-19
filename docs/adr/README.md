@@ -9,13 +9,13 @@ never edited afterwards except to mark it superseded.
 | --- | --- | --- |
 | [0001](0001-pure-deterministic-core.md) | The consensus core is a pure state machine with no clock, I/O or goroutines | Accepted |
 | [0002](0002-synchronous-persistence.md) | Persist synchronously in the core, accepting a measured ~125 writes/sec ceiling | Accepted |
-| 0003 | Read-index rather than naive leader reads | Planned |
+| [0003](0003-read-index.md) | Read-index for linearizable reads, rather than naive leader reads or a lease | Accepted |
 | 0004 | StatefulSet rather than Deployment | Planned |
 
 ## Format
 
 ```text
-# NNNN — Title
+#  Title
 
 ## Status
 Proposed | Accepted | Superseded by NNNN

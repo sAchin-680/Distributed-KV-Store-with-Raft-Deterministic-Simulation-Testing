@@ -164,6 +164,30 @@ MUTATIONS: list[Mutation] = [
         why="Repairing a divergent follower costs one round trip per entry instead "
         "of per term: 204 round trips instead of 6, measured.",
     ),
+    Mutation(
+        name="read/confirmed-without-a-quorum",
+        file="raft/read.go",
+        old="""		req.acks[from] = true
+		if r.conf.HasQuorum(func(n NodeID) bool { return req.acks[n] }) {""",
+        new="""		req.acks[from] = true
+		if true {""",
+        expect="TestReadIndexNeedsAMajorityNotJustOneReply|TestPartitionedLeaderCannotConfirmARead",
+        why="A partitioned leader serves reads from a state machine that stopped "
+        "advancing — stale data returned as current, with no error.",
+    ),
+    Mutation(
+        name="read/served-before-a-current-term-entry-commits",
+        file="raft/read.go",
+        old="""	if !r.committedInCurrentTerm() {
+		return ErrReadIndexUnavailable
+	}""",
+        new="""	if false {
+		return ErrReadIndexUnavailable
+	}""",
+        expect="TestReadIndexWaitsForAnEntryFromTheCurrentTerm",
+        why="A new leader's commit index understates what the cluster has "
+        "committed, so the read can miss a write that already completed.",
+    ),
 ]
 
 
