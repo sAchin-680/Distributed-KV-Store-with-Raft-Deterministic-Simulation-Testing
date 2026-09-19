@@ -99,6 +99,17 @@ test: ## Run unit tests with the race detector
 test-short: ## Run only fast tests (skips long simulation suites)
 	$(GO) test -short -count=1 -timeout=2m ./...
 
+# Introduces known bugs and checks that the test named after each one actually
+# fails. A passing test proves nothing until you have watched it fail; this has
+# already caught two decorative tests here.
+.PHONY: bench
+bench: ## Run the consensus-core benchmarks
+	$(GO) test ./raft/ -run XXX -bench . -benchtime=1s -count=3
+
+.PHONY: mutation
+mutation: ## Verify the tests can detect the bugs they are named after
+	python3 scripts/mutation-check.py
+
 .PHONY: cover
 cover: ## Run tests and open an HTML coverage report
 	$(GO) test -race -count=1 -coverprofile=coverage.out -covermode=atomic ./...
@@ -179,7 +190,7 @@ determinism: ## Verify the consensus core contains no sources of nondeterminism
 	./scripts/check-determinism.sh
 
 .PHONY: check
-check: fmt-check vet determinism lint test ## Everything CI runs on a pull request
+check: fmt-check vet determinism lint test mutation ## Everything CI runs on a pull request
 	@echo "all checks passed"
 
 ## ---------------------------------------------------------------------------

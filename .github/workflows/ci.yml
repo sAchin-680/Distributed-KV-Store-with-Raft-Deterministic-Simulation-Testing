@@ -96,6 +96,11 @@ jobs:
 
       - run: make test
 
+      # A test that cannot fail on the bug it is named after is decorative.
+      # This introduces each known bug and checks the guarding test notices.
+      - name: Mutation check
+        run: make mutation
+
   # ---------------------------------------------------------------------------
   # The correctness gate.
   #

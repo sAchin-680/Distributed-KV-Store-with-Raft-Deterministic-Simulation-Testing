@@ -276,20 +276,23 @@ func TestPreVotePreventsDisruptionByRejoiningNode(t *testing.T) {
 			"advance the term", got, termBefore)
 	}
 
-	// It rejoins and immediately tries again, rather than waiting for a
-	// heartbeat to put it back in its place — otherwise this would only be
-	// testing that heartbeats arrive promptly.
+	// It rejoins and is allowed to catch up first, so that when it campaigns
+	// its log is current and the election restriction has nothing to object to.
+	// Otherwise the refusal would be over-determined and this test would pass
+	// even with the lease check removed.
 	n.heal()
+	n.tickAll(5)
+	if got, want := n.node(3).LastIndex(), leader.LastIndex(); got != want {
+		t.Fatalf("rejoining node did not catch up: last index %d, want %d", got, want)
+	}
+
+	// Now it tries again, rather than waiting for a heartbeat to put it back in
+	// its place — otherwise this would only test that heartbeats arrive.
 	if err := n.node(3).Campaign(); err != nil {
 		t.Fatalf("Campaign: %v", err)
 	}
 	n.deliver()
 	n.tickAll(5)
-
-	// Note the refusal here is over-determined in this milestone: heartbeats do
-	// not yet carry entries, so node 3's log is behind the leader's no-op as
-	// well as its lease being live. TestPreVoteIsRefusedWhileALeaderIsAlive
-	// isolates the lease check on its own.
 
 	if leader.State() != Leader {
 		t.Errorf("leader was disrupted by the rejoining node\n%s", n.dump())
@@ -380,8 +383,13 @@ func TestPreVoteIsRefusedWhileALeaderIsAlive(t *testing.T) {
 	n.requireSingleLeader()
 
 	follower := n.node(2)
+
+	// The candidate's log is deliberately as up to date as the follower's, so
+	// that the election restriction has no reason to refuse. The only thing
+	// left that can say no is the lease check — which is the point of the test.
 	if err := follower.Step(Message{
 		Type: MsgVoteReq, From: 3, To: 2, Term: follower.Term() + 1, PreVote: true,
+		LastLogIndex: follower.LastIndex(), LastLogTerm: follower.log.lastTerm(),
 	}); err != nil {
 		t.Fatalf("Step: %v", err)
 	}
