@@ -19,6 +19,15 @@ LDFLAGS   := -s -w \
 # exists and `make build` never fails on one that does not yet.
 CMDS := $(notdir $(patsubst %/,%,$(sort $(dir $(wildcard cmd/*/*.go)))))
 
+# Code generation is only reproducible if the toolchain is pinned. Both plugins
+# stamp their own version into every generated file, so an unpinned `@latest`
+# makes proto-check fail the moment upstream tags a release — a failure that has
+# nothing to do with this repository. CI installs these same versions.
+PROTOC_VERSION          := 32.1
+PROTOC_GEN_GO_VERSION   := v1.36.11
+PROTOC_GEN_GRPC_VERSION := v1.6.2
+GOLANGCILINT_VERSION    := v2.5.0
+
 ## ---------------------------------------------------------------------------
 ## Build
 ## ---------------------------------------------------------------------------
@@ -150,11 +159,20 @@ lint: ## Run golangci-lint
 	fi
 
 .PHONY: tools
-tools: ## Install the development tools this project uses
-	$(GO) install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
-	$(GO) install google.golang.org/protobuf/cmd/protoc-gen-go@latest
-	$(GO) install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+tools: ## Install the pinned development tools (see the versions at the top)
+	$(GO) install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCILINT_VERSION)
+	$(GO) install google.golang.org/protobuf/cmd/protoc-gen-go@$(PROTOC_GEN_GO_VERSION)
+	$(GO) install google.golang.org/grpc/cmd/protoc-gen-go-grpc@$(PROTOC_GEN_GRPC_VERSION)
 	@echo "installed into $$($(GO) env GOPATH)/bin"
+
+.PHONY: tools-check
+tools-check: ## Report whether the installed codegen tools match the pinned versions
+	@ok=0; \
+	got=$$(protoc-gen-go --version 2>&1 | awk '{print $$NF}'); \
+	[ "$$got" = "$(PROTOC_GEN_GO_VERSION)" ] || { echo "protoc-gen-go: $$got, want $(PROTOC_GEN_GO_VERSION)"; ok=1; }; \
+	got=$$(protoc-gen-go-grpc --version 2>&1 | awk '{print $$NF}'); \
+	[ "v$$got" = "$(PROTOC_GEN_GRPC_VERSION)" ] || { echo "protoc-gen-go-grpc: v$$got, want $(PROTOC_GEN_GRPC_VERSION)"; ok=1; }; \
+	[ $$ok -eq 0 ] && echo "codegen tools match the pinned versions" || { echo "run 'make tools'"; exit 1; }
 
 .PHONY: determinism
 determinism: ## Verify the consensus core contains no sources of nondeterminism

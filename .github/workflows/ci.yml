@@ -71,11 +71,13 @@ jobs:
           version: "32.1"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install protoc plugins
-        run: |
-          go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
-          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+      # Installs the versions pinned in the Makefile, not @latest. Both plugins
+      # stamp their version into every generated file, so an unpinned install
+      # fails this job whenever upstream tags a release.
+      - name: Install pinned protoc plugins
+        run: make tools
 
+      - run: make tools-check
       - run: make proto-check
 
   # ---------------------------------------------------------------------------
