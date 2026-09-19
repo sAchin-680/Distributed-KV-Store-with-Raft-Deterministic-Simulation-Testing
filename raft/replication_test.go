@@ -489,3 +489,144 @@ func TestEntriesAreOnlyAppliedAfterTheyCommit(t *testing.T) {
 			"applied before it commits can still be overwritten")
 	}
 }
+
+// Regression: a stale rejection must not drive Next below Match.
+//
+// Match is what the follower confirmed about itself. A rejection that would take
+// the leader below it was sent before Match advanced — by a delayed message, a
+// duplicate, or a snapshot that moved Match forward in one jump. Acting on it
+// makes the leader resend entries the follower has already committed, and the
+// follower refuses them as an attempt to overwrite its committed prefix.
+//
+// Found by the simulator at seed 188 once snapshotting was enabled; plain
+// nextIndex decrementing hides it, because a follower that matched would not
+// have rejected.
+func TestStaleRejectionCannotRewindBelowMatch(t *testing.T) {
+	leader := figure8Leader(t)
+
+	// The follower has confirmed everything up to the no-op.
+	confirmed := leader.LastIndex()
+	if err := leader.Step(Message{
+		Type: MsgAppendResp, From: 2, To: 1, Term: leader.Term(),
+		Success: true, MatchIndex: confirmed,
+	}); err != nil && !errors.Is(err, ErrIgnoredMessage) {
+		t.Fatalf("Step: %v", err)
+	}
+	leader.Messages()
+
+	pr, ok := leader.Progress(2)
+	if !ok || pr.Match != confirmed {
+		t.Fatalf("setup: match = %d, want %d", pr.Match, confirmed)
+	}
+
+	// Now a rejection from before that acknowledgement finally arrives, hinting
+	// all the way back to the start of the log.
+	if err := leader.Step(Message{
+		Type: MsgAppendResp, From: 2, To: 1, Term: leader.Term(),
+		Success: false, ConflictIndex: 1, ConflictTerm: 0,
+	}); err != nil && !errors.Is(err, ErrIgnoredMessage) {
+		t.Fatalf("Step: %v", err)
+	}
+
+	pr, _ = leader.Progress(2)
+	if pr.Next <= pr.Match {
+		t.Fatalf("next = %d with match = %d: the leader would resend entries the "+
+			"follower has already committed, which it correctly refuses",
+			pr.Next, pr.Match)
+	}
+
+	// And nothing it now sends may reach below the confirmed point.
+	for _, m := range leader.Messages() {
+		if m.To == 2 && m.PrevLogIndex < pr.Match {
+			t.Errorf("leader sent prevLogIndex %d to a follower matched at %d",
+				m.PrevLogIndex, pr.Match)
+		}
+	}
+}
+
+// Regression: a stale append below the commit index must be answered, not
+// scanned for conflicts.
+//
+// The network delivers messages late. A leader that once had to send entries
+// from the start of the log has moved on since, and those old messages still
+// arrive. By then the follower has committed past them and may have compacted
+// them away entirely — at which point the conflict scan cannot verify them,
+// reports an entry that is merely *unknown* as *conflicting*, and the log
+// refuses it as an attempt to overwrite its committed prefix.
+//
+// Found by the simulator at seed 188, once snapshotting made compaction
+// routine. Unreachable before that, because the scan could still verify the
+// old entries and correctly found no conflict.
+func TestStaleAppendBelowCommitIndexIsAnswered(t *testing.T) {
+	follower := newTestLogNode(t, 3)
+
+	// Catch it up and commit, the way a live follower would be.
+	entries := make([]LogEntry, 0, 60)
+	for i := 1; i <= 60; i++ {
+		entries = append(entries, LogEntry{Index: Index(i), Term: 1})
+	}
+	if err := follower.Step(Message{
+		Type: MsgAppendReq, From: 1, To: 2, Term: 1,
+		PrevLogIndex: 0, PrevLogTerm: 0, Entries: entries, LeaderCommit: 58,
+	}); err != nil {
+		t.Fatalf("Step: %v", err)
+	}
+	follower.Messages()
+
+	if follower.CommitIndex() != 58 {
+		t.Fatalf("setup: commit = %d, want 58", follower.CommitIndex())
+	}
+
+	// Compact, which is what a snapshot does and what makes the old entries
+	// unverifiable rather than merely redundant.
+	follower.ApplyTo(58)
+	if _, err := follower.CreateSnapshot([]byte("state")); err != nil {
+		t.Fatalf("CreateSnapshot: %v", err)
+	}
+
+	// Now the delayed message finally arrives, carrying entries from index 1.
+	err := follower.Step(Message{
+		Type: MsgAppendReq, From: 1, To: 2, Term: 1,
+		PrevLogIndex: 0, PrevLogTerm: 0, Entries: entries[:10], LeaderCommit: 5,
+	})
+	if err != nil {
+		t.Fatalf("a stale append was treated as a safety violation: %v", err)
+	}
+
+	msgs := follower.Messages()
+	if len(msgs) != 1 {
+		t.Fatalf("want one reply, got %d", len(msgs))
+	}
+	if !msgs[0].Success {
+		t.Error("the stale append was rejected; the leader would then back up " +
+			"and send even older entries")
+	}
+	if msgs[0].MatchIndex != 58 {
+		t.Errorf("match index = %d, want 58 — the reply should tell the leader "+
+			"how far we actually are, not how far its stale message reached",
+			msgs[0].MatchIndex)
+	}
+	if follower.CommitIndex() != 58 {
+		t.Errorf("commit index moved to %d; a stale message must not retract a "+
+			"commit", follower.CommitIndex())
+	}
+}
+
+// newTestLogNode builds a single follower in a cluster of the given size.
+func newTestLogNode(t *testing.T, clusterSize int) *RawNode {
+	t.Helper()
+	voters := make([]NodeID, clusterSize)
+	for i := range voters {
+		voters[i] = NodeID(i + 1)
+	}
+	n, err := NewRawNode(Config{
+		ID: 2, Storage: NewMemoryStorage(),
+		ElectionTick: 10, HeartbeatTick: 1,
+		Rand: fixedRand{}, Bootstrap: NewConfiguration(voters),
+		SnapshotThreshold: 10, SnapshotCatchUpEntries: 5,
+	})
+	if err != nil {
+		t.Fatalf("NewRawNode: %v", err)
+	}
+	return n
+}

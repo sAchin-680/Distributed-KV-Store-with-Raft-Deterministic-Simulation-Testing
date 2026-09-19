@@ -240,6 +240,16 @@ func TestTermIsAnswerableAtTheSnapshotBoundary(t *testing.T) {
 	if err := l.storage.SaveSnapshot(snap); err != nil {
 		t.Fatalf("SaveSnapshot: %v", err)
 	}
+	// Saving records the snapshot; discarding entries is a separate step, so
+	// that a leader can keep a tail past the snapshot point for followers that
+	// are only slightly behind.
+	if got := l.firstIndex(); got != 1 {
+		t.Errorf("firstIndex = %d after SaveSnapshot alone, want 1 — saving must "+
+			"not discard entries on its own", got)
+	}
+	if err := l.compact(3); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
 
 	// The boundary index itself must still answer — an AppendEntries
 	// consistency check can legitimately reach back to exactly here.
