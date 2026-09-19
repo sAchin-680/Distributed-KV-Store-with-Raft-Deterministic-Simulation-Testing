@@ -224,6 +224,50 @@ MUTATIONS: list[Mutation] = [
         why="Nodes evict different sessions, so replicas diverge silently and only "
         "visibly much later.",
     ),
+    Mutation(
+        name="snapshot/stale-append-below-commit-is-scanned",
+        file="raft/replication.go",
+        old="""	if m.PrevLogIndex < r.log.committed {""",
+        new="""	if false {""",
+        expect="TestStaleAppendBelowCommitIndexIsAnswered",
+        why="A delayed append arriving after compaction is scanned for conflicts "
+        "it cannot verify, so an entry that is merely unknown is reported as "
+        "conflicting and the node refuses it as a safety violation. Found by the "
+        "simulator at seed 188.",
+    ),
+    Mutation(
+        name="snapshot/rejection-rewinds-below-match",
+        file="raft/replication.go",
+        old="""	if next <= pr.Match {
+		next = pr.Match + 1
+	}""",
+        new="""	_ = pr.Match""",
+        expect="TestStaleRejectionCannotRewindBelowMatch",
+        why="A delayed rejection makes the leader resend entries the follower has "
+        "already confirmed, which the follower then refuses.",
+    ),
+    Mutation(
+        name="snapshot/log-floor-confused-with-snapshot-boundary",
+        file="storage/bolt.go",
+        old="""	case upto <= s.floorIndex:""",
+        new="""	case upto <= s.snapIndex:""",
+        expect="TestCompactBelowTheSnapshotBoundaryStillWorks",
+        why="Compact decides it has already run and silently does nothing, so the "
+        "log grows for ever behind a snapshot that claimed to have shortened it.",
+        pkg="./storage/",
+    ),
+    Mutation(
+        name="snapshot/state-machine-not-restored-at-startup",
+        file="node/node.go",
+        old="""	if err := n.restoreFromDisk(); err != nil {
+		return nil, err
+	}""",
+        new="""	_ = n.restoreFromDisk""",
+        expect="TestNodeRestoresFromItsOwnSnapshot",
+        why="A node restarting from a snapshot comes back holding only what the "
+        "compacted log still has — a fraction of its state, silently.",
+        pkg="./node/",
+    ),
 ]
 
 
