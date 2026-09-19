@@ -19,18 +19,24 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Raft_RequestVote_FullMethodName     = "/raft.v1.Raft/RequestVote"
-	Raft_AppendEntries_FullMethodName   = "/raft.v1.Raft/AppendEntries"
-	Raft_InstallSnapshot_FullMethodName = "/raft.v1.Raft/InstallSnapshot"
+	Raft_Deliver_FullMethodName = "/raft.v1.Raft/Deliver"
 )
 
 // RaftClient is the client API for Raft service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type RaftClient interface {
-	RequestVote(ctx context.Context, in *RequestVoteRequest, opts ...grpc.CallOption) (*RequestVoteResponse, error)
-	AppendEntries(ctx context.Context, in *AppendEntriesRequest, opts ...grpc.CallOption) (*AppendEntriesResponse, error)
-	InstallSnapshot(ctx context.Context, in *InstallSnapshotRequest, opts ...grpc.CallOption) (*InstallSnapshotResponse, error)
+	// Deliver carries a stream of messages from one peer.
+	//
+	// Client-streaming rather than unary: a healthy cluster sends heartbeats
+	// several times a second to every peer forever, and paying a request/response
+	// round trip and its headers for each one is pure overhead. One long-lived
+	// stream per peer direction amortizes it away.
+	//
+	// There is no per-message acknowledgement, deliberately. Raft already assumes
+	// an unreliable network and retries on its own schedule; an acknowledgement
+	// here would be a second, weaker retry mechanism layered under the real one.
+	Deliver(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[RaftMessage, DeliverAck], error)
 }
 
 type raftClient struct {
@@ -41,43 +47,34 @@ func NewRaftClient(cc grpc.ClientConnInterface) RaftClient {
 	return &raftClient{cc}
 }
 
-func (c *raftClient) RequestVote(ctx context.Context, in *RequestVoteRequest, opts ...grpc.CallOption) (*RequestVoteResponse, error) {
+func (c *raftClient) Deliver(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[RaftMessage, DeliverAck], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(RequestVoteResponse)
-	err := c.cc.Invoke(ctx, Raft_RequestVote_FullMethodName, in, out, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &Raft_ServiceDesc.Streams[0], Raft_Deliver_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
-	return out, nil
+	x := &grpc.GenericClientStream[RaftMessage, DeliverAck]{ClientStream: stream}
+	return x, nil
 }
 
-func (c *raftClient) AppendEntries(ctx context.Context, in *AppendEntriesRequest, opts ...grpc.CallOption) (*AppendEntriesResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(AppendEntriesResponse)
-	err := c.cc.Invoke(ctx, Raft_AppendEntries_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *raftClient) InstallSnapshot(ctx context.Context, in *InstallSnapshotRequest, opts ...grpc.CallOption) (*InstallSnapshotResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(InstallSnapshotResponse)
-	err := c.cc.Invoke(ctx, Raft_InstallSnapshot_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Raft_DeliverClient = grpc.ClientStreamingClient[RaftMessage, DeliverAck]
 
 // RaftServer is the server API for Raft service.
 // All implementations must embed UnimplementedRaftServer
 // for forward compatibility.
 type RaftServer interface {
-	RequestVote(context.Context, *RequestVoteRequest) (*RequestVoteResponse, error)
-	AppendEntries(context.Context, *AppendEntriesRequest) (*AppendEntriesResponse, error)
-	InstallSnapshot(context.Context, *InstallSnapshotRequest) (*InstallSnapshotResponse, error)
+	// Deliver carries a stream of messages from one peer.
+	//
+	// Client-streaming rather than unary: a healthy cluster sends heartbeats
+	// several times a second to every peer forever, and paying a request/response
+	// round trip and its headers for each one is pure overhead. One long-lived
+	// stream per peer direction amortizes it away.
+	//
+	// There is no per-message acknowledgement, deliberately. Raft already assumes
+	// an unreliable network and retries on its own schedule; an acknowledgement
+	// here would be a second, weaker retry mechanism layered under the real one.
+	Deliver(grpc.ClientStreamingServer[RaftMessage, DeliverAck]) error
 	mustEmbedUnimplementedRaftServer()
 }
 
@@ -88,14 +85,8 @@ type RaftServer interface {
 // pointer dereference when methods are called.
 type UnimplementedRaftServer struct{}
 
-func (UnimplementedRaftServer) RequestVote(context.Context, *RequestVoteRequest) (*RequestVoteResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method RequestVote not implemented")
-}
-func (UnimplementedRaftServer) AppendEntries(context.Context, *AppendEntriesRequest) (*AppendEntriesResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method AppendEntries not implemented")
-}
-func (UnimplementedRaftServer) InstallSnapshot(context.Context, *InstallSnapshotRequest) (*InstallSnapshotResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method InstallSnapshot not implemented")
+func (UnimplementedRaftServer) Deliver(grpc.ClientStreamingServer[RaftMessage, DeliverAck]) error {
+	return status.Error(codes.Unimplemented, "method Deliver not implemented")
 }
 func (UnimplementedRaftServer) mustEmbedUnimplementedRaftServer() {}
 func (UnimplementedRaftServer) testEmbeddedByValue()              {}
@@ -118,59 +109,12 @@ func RegisterRaftServer(s grpc.ServiceRegistrar, srv RaftServer) {
 	s.RegisterService(&Raft_ServiceDesc, srv)
 }
 
-func _Raft_RequestVote_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(RequestVoteRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(RaftServer).RequestVote(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: Raft_RequestVote_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(RaftServer).RequestVote(ctx, req.(*RequestVoteRequest))
-	}
-	return interceptor(ctx, in, info, handler)
+func _Raft_Deliver_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(RaftServer).Deliver(&grpc.GenericServerStream[RaftMessage, DeliverAck]{ServerStream: stream})
 }
 
-func _Raft_AppendEntries_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(AppendEntriesRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(RaftServer).AppendEntries(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: Raft_AppendEntries_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(RaftServer).AppendEntries(ctx, req.(*AppendEntriesRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _Raft_InstallSnapshot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(InstallSnapshotRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(RaftServer).InstallSnapshot(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: Raft_InstallSnapshot_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(RaftServer).InstallSnapshot(ctx, req.(*InstallSnapshotRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Raft_DeliverServer = grpc.ClientStreamingServer[RaftMessage, DeliverAck]
 
 // Raft_ServiceDesc is the grpc.ServiceDesc for Raft service.
 // It's only intended for direct use with grpc.RegisterService,
@@ -178,20 +122,13 @@ func _Raft_InstallSnapshot_Handler(srv interface{}, ctx context.Context, dec fun
 var Raft_ServiceDesc = grpc.ServiceDesc{
 	ServiceName: "raft.v1.Raft",
 	HandlerType: (*RaftServer)(nil),
-	Methods: []grpc.MethodDesc{
+	Methods:     []grpc.MethodDesc{},
+	Streams: []grpc.StreamDesc{
 		{
-			MethodName: "RequestVote",
-			Handler:    _Raft_RequestVote_Handler,
-		},
-		{
-			MethodName: "AppendEntries",
-			Handler:    _Raft_AppendEntries_Handler,
-		},
-		{
-			MethodName: "InstallSnapshot",
-			Handler:    _Raft_InstallSnapshot_Handler,
+			StreamName:    "Deliver",
+			Handler:       _Raft_Deliver_Handler,
+			ClientStreams: true,
 		},
 	},
-	Streams:  []grpc.StreamDesc{},
 	Metadata: "raft.proto",
 }
