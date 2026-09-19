@@ -144,6 +144,12 @@ type RawNode struct {
 	// make nodes campaign in lockstep and split the vote forever.
 	randomizedElectionTimeout int
 
+	// pendingReads are read barriers awaiting quorum confirmation, and
+	// readStates are the ones confirmed and not yet drained. Both are slices so
+	// their order is identical on every run of a seed.
+	pendingReads []*readRequest
+	readStates   []ReadState
+
 	msgs []Message
 }
 
@@ -281,6 +287,9 @@ func (r *RawNode) reset(term Term) {
 
 	r.votes = make(map[NodeID]bool)
 	r.progress = nil
+
+	// A read barrier is only meaningful under the leadership that recorded it.
+	r.dropPendingReads()
 }
 
 func (r *RawNode) resetRandomizedElectionTimeout() {
@@ -359,6 +368,13 @@ func (r *RawNode) becomeLeader() error {
 	r.progress[r.id].Match = noop.Index
 	r.progress[r.id].Next = noop.Index + 1
 
+	// Try to commit it straight away. In a single-node cluster this is the only
+	// opportunity: there are no peers to respond, so without this the no-op
+	// would sit uncommitted until a client happened to write, and a linearizable
+	// read would be refused forever on a cluster that is perfectly healthy.
+	if _, err := r.maybeAdvanceCommit(); err != nil {
+		return err
+	}
 	if err := r.persistHardState(); err != nil {
 		return err
 	}
@@ -407,6 +423,22 @@ func (r *RawNode) tickHeartbeat() error {
 	}
 	r.heartbeatElapsed = 0
 	r.broadcastAppend()
+
+	// Re-ask for confirmation of any read still waiting.
+	//
+	// The heartbeats that carried a read barrier out can be lost, and nothing
+	// else would ever retry them — the read would wait forever on a cluster
+	// that is working fine. Riding the heartbeat means a read costs at most one
+	// heartbeat interval of extra latency when its first round goes missing.
+	//
+	// This is where batching would pay: one confirmation round proves leadership
+	// for every barrier recorded before it, so all pending reads could share a
+	// single marker instead of each getting their own.
+	for _, req := range r.pendingReads {
+		for _, peer := range r.conf.Peers(r.id) {
+			r.sendAppendWithRead(peer, req.id)
+		}
+	}
 	return nil
 }
 

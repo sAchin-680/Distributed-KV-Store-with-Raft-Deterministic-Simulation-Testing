@@ -64,7 +64,12 @@ func (r *RawNode) broadcastAppend() {
 // With no entries to send this is a heartbeat, which is the same message with an
 // empty payload — the paper deliberately gives them one form, so that every
 // heartbeat also carries a consistency check and the current commit index.
-func (r *RawNode) sendAppend(to NodeID) {
+func (r *RawNode) sendAppend(to NodeID) { r.sendAppendWithRead(to, 0) }
+
+// sendAppendWithRead is sendAppend carrying a read barrier's id, which the
+// follower echoes back so the leader can match the confirmation to the read
+// that asked for it.
+func (r *RawNode) sendAppendWithRead(to NodeID, readID uint64) {
 	pr, ok := r.progress[to]
 	if !ok {
 		return
@@ -103,6 +108,7 @@ func (r *RawNode) sendAppend(to NodeID) {
 		PrevLogTerm:  prevTerm,
 		Entries:      entries,
 		LeaderCommit: r.log.committed,
+		ReadID:       readID,
 	})
 }
 
@@ -167,6 +173,14 @@ func (r *RawNode) handleAppendResponse(m Message) error {
 	pr, ok := r.progress[m.From]
 	if !ok {
 		return fmt.Errorf("raft: append response from untracked peer %d: %w", m.From, ErrIgnoredMessage)
+	}
+
+	// A response carrying our own term confirms this peer still accepts us as
+	// leader, which is all a read barrier is asking. Checked before the
+	// success branch because a rejected append confirms leadership just as well
+	// as an accepted one.
+	if m.ReadID != 0 {
+		r.ackRead(m.From, m.ReadID)
 	}
 
 	if m.Success {
