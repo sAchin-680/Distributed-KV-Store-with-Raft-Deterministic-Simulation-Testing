@@ -16,8 +16,9 @@ random source, and reproduces any execution exactly.
 When a randomized run finds a safety violation, it prints one number. That number
 is enough for anyone to replay the identical failure, byte for byte, forever.
 
-> **Status:** in active development. Leader election works, with pre-vote; log
-> replication is next. See [Status](#status) for what is built and what is coming.
+> **Status:** in active development. Consensus works — leader election with
+> pre-vote, log replication, and the current-term commit rule. The deterministic
+> simulator is next. See [Status](#status) for what is built and what is coming.
 
 ```text
                      ┌───────────────────────────────────────────────┐
@@ -183,8 +184,8 @@ Built in milestones, each with an explicit exit criterion rather than a vibe.
 | done | Build tooling, protobuf codegen, CI, determinism guards |
 | done | Core types, the log, cluster configuration, storage contract |
 | done | Leader election — election restriction, pre-vote |
-| next | Log replication — log matching and the commit rule |
-| | Deterministic simulator, fault injection, safety checker |
+| done | Log replication — log matching and the commit rule |
+| next | Deterministic simulator, fault injection, safety checker |
 | | bbolt storage, gRPC transport, node driver |
 | | KV state machine with read-index linearizable reads |
 | | Snapshotting and `InstallSnapshot` |
