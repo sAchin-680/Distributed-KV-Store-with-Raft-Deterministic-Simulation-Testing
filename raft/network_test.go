@@ -17,7 +17,7 @@ import (
 // It is still strictly deterministic: nodes are always visited in sorted order,
 // never in map order, for the same reason the core keeps its peer lists sorted.
 type network struct {
-	t     *testing.T
+	t     testing.TB
 	ids   []NodeID
 	nodes map[NodeID]*RawNode
 
@@ -52,6 +52,8 @@ func withLearners(ids ...NodeID) clusterOption {
 // withJitter fixes each node's election-timeout offset, so that the node with
 // the smallest offset always campaigns first. Removes the randomness from tests
 // that are about something other than randomness.
+func withSeed(seed int64) clusterOption { return func(o *clusterOptions) { o.seed = seed } }
+
 func withJitter(j map[NodeID]int) clusterOption {
 	return func(o *clusterOptions) { o.jitter = j }
 }
@@ -77,7 +79,7 @@ type seededRand struct{ r *rand.Rand }
 
 func (s seededRand) Intn(n int) int { return s.r.Intn(n) }
 
-func newNetwork(t *testing.T, voters []NodeID, opts ...clusterOption) *network {
+func newNetwork(t testing.TB, voters []NodeID, opts ...clusterOption) *network {
 	t.Helper()
 
 	o := clusterOptions{preVote: true, electionTick: 10, heartbeatTick: 1, seed: 1}
