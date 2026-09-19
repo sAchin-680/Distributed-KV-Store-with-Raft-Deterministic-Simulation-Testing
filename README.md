@@ -71,12 +71,54 @@ The simulator proves the *algorithm* under adversarial scheduling. The chaos rig
 proves the *implementation* under real gRPC deadlines, real fsyncs and real OS
 scheduling. Neither is redundant; each covers the other's blind spot.
 
+## Measured
+
+Core-only numbers — no disk, no network, no goroutines. They say how much
+headroom the algorithm leaves, not what a cluster sustains; a real deployment is
+bounded by fsync and network round trips. Apple M4 Pro, Go 1.25.1, median of 3
+runs. Reproduce with `make bench` and `make mutation`.
+
+| | |
+| --- | --- |
+| Commit round, 3-node cluster | 1.55 µs — **647k commits/sec** |
+| Commit round, 5-node cluster | 3.13 µs — **320k commits/sec** |
+| Steady-state heartbeat, 3-node | 595 ns |
+| Leader election from cold start | **12.1 logical ticks** median |
+| Seeded bugs caught by the test suite | **10 / 10** |
+| Statement coverage of the core | 76.5% |
+| Test-to-code ratio | 0.98 : 1 |
+
+### What the conflict-hint optimization is worth
+
+Repairing a follower whose log diverged by 200 entries across 2 terms, measured
+both ways:
+
+| | Round trips | Wall time |
+| --- | --- | --- |
+| With the §5.3 conflict hint | **6** | 12 µs |
+| Backing up one index at a time | 204 | 208 µs |
+
+34× fewer round trips. Those are *network* round trips in a real cluster: at
+1 ms RTT it is the difference between a 6 ms rejoin and a 204 ms one.
+
+### Mutation testing
+
+`make mutation` seeds ten known Raft bugs — the classic ones, including Figure 8
+and index-first log comparison — and checks that the test named after each one
+actually fails. It runs in 2.2 s and gates CI.
+
+A passing test proves nothing until you have watched it fail. This has caught
+**three decorative tests** in this repository: tests that passed even with the
+bug they were named after present. One example: the pre-vote lease test left
+`LastLogIndex` at zero, so the election restriction was doing the refusing and
+the lease check could be deleted without the test noticing.
+
 ## Quickstart
 
 ```bash
 git clone https://github.com/sAchin-680/Distributed-KV-Store-with-Raft-Deterministic-Simulation-Testing.git raftkv
 cd raftkv
-make check      # vet + determinism guards + lint + tests
+make check      # fmt, vet, determinism guards, lint, tests, mutation check
 ```
 
 Go 1.25+ is the only requirement for building and testing. The rest is needed
@@ -110,7 +152,9 @@ go test -race -count=10 ./raft                 # repeat, to shake out flakes
 ### Static analysis
 
 ```bash
-make check          # everything CI runs: fmt, vet, determinism, lint, tests
+make check          # everything CI runs: fmt, vet, determinism, lint, tests, mutation
+make bench          # consensus-core throughput benchmarks
+make mutation       # verify the tests can detect the bugs they are named after
 make fmt            # format
 make fmt-check      # fail if anything is unformatted
 make vet
