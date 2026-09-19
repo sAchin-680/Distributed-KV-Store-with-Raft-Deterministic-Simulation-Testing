@@ -198,7 +198,7 @@ func (c *Checker) Final(s *Simulator) error {
 }
 
 // checkStateMachinesAgree: no two nodes have applied a different command at the
-// same position.
+// same log index.
 //
 // This is State Machine Safety stated at the level users care about. The
 // committed-entry check above looks at logs; this one looks at what was actually
@@ -206,23 +206,35 @@ func (c *Checker) Final(s *Simulator) error {
 // — draining twice, skipping an entry, applying before commit — would leave the
 // logs identical and the state machines divergent.
 //
-// Nodes apply at different rates, so only the common prefix is comparable.
+// Compared by log index rather than by position in each node's list.
+//
+// Position would be wrong, and was: once snapshotting exists, a node that
+// restarted rebuilds its state machine from a snapshot and its history
+// legitimately begins partway through the log. Two correct nodes then hold the
+// same command at different positions. Indexing by log index states the property
+// that actually matters — "no two nodes disagree about what is at index i" —
+// and is immune to where each node's history happens to start.
 func (c *Checker) checkStateMachinesAgree(s *Simulator) error {
 	for ai, a := range s.ids {
-		for _, b := range s.ids[ai+1:] {
-			na, nb := s.nodes[a], s.nodes[b]
-			limit := min(len(na.applied), len(nb.applied))
+		byIndex := make(map[raft.Index]raft.LogEntry, len(s.nodes[a].applied))
+		for _, e := range s.nodes[a].applied {
+			byIndex[e.Index] = e
+		}
 
-			for i := range limit {
-				ea, eb := na.applied[i], nb.applied[i]
-				if ea.Index != eb.Index || ea.Term != eb.Term ||
+		for _, b := range s.ids[ai+1:] {
+			for _, eb := range s.nodes[b].applied {
+				ea, both := byIndex[eb.Index]
+				if !both {
+					continue
+				}
+				if ea.Term != eb.Term ||
 					sha256.Sum256(ea.Command) != sha256.Sum256(eb.Command) {
 					return c.fail(s, PropStateMachineSafety, fmt.Sprintf(
-						"nodes %d and %d applied different commands at position %d: "+
-							"%d@%d (%s) vs %d@%d (%s)",
-						a, b, i,
-						ea.Index, ea.Term, shortDigest(sha256.Sum256(ea.Command)),
-						eb.Index, eb.Term, shortDigest(sha256.Sum256(eb.Command))))
+						"nodes %d and %d applied different commands at index %d: "+
+							"term %d (%s) vs term %d (%s)",
+						a, b, eb.Index,
+						ea.Term, shortDigest(sha256.Sum256(ea.Command)),
+						eb.Term, shortDigest(sha256.Sum256(eb.Command))))
 				}
 			}
 		}

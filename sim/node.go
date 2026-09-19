@@ -1,6 +1,7 @@
 package sim
 
 import (
+	"encoding/binary"
 	"fmt"
 
 	"github.com/sAchin-680/raftkv/raft"
@@ -29,6 +30,11 @@ type node struct {
 	crashes  int
 	restarts int
 
+	// restoredFrom is the boundary of the last snapshot this node installed,
+	// which tells the checker that everything below it came from an image
+	// rather than from entries it applied itself.
+	restoredFrom raft.Index
+
 	// applied is the simulated state machine: every committed command this node
 	// has consumed, in order. Kept so a later layer can compare state machines
 	// across nodes; for now its length is a cheap liveness signal.
@@ -46,6 +52,32 @@ func (n *node) start(cfg raft.Config) error {
 		return fmt.Errorf("sim: starting node %d: %w", n.id, err)
 	}
 	n.rn = rn
+
+	// Rebuild the state machine from this node's own persisted snapshot.
+	//
+	// A restarting node resumes applying from its persisted applied index, not
+	// from the start of the log — the entries below that point were folded into
+	// a snapshot and are gone. So the state machine has to come back from that
+	// snapshot, exactly as a real one would.
+	//
+	// Leaving this out is what made the first snapshot-enabled fuzz run report
+	// safety violations: the simulated state machine restarted empty and then
+	// only collected the tail, so two nodes' histories legitimately began at
+	// different points and the checker called that divergence. The bug was in
+	// the model, not in Raft.
+	snap, err := n.storage.LoadSnapshot()
+	if err != nil {
+		return fmt.Errorf("sim: node %d loading its snapshot: %w", n.id, err)
+	}
+	if !snap.IsEmpty() {
+		applied, err := decodeStateMachine(snap.Data)
+		if err != nil {
+			return fmt.Errorf("sim: node %d restoring its snapshot at %d: %w",
+				n.id, snap.LastIncludedIndex, err)
+		}
+		n.applied = applied
+		n.restoredFrom = snap.LastIncludedIndex
+	}
 	return nil
 }
 
@@ -87,6 +119,78 @@ func (n *node) drainApplied() error {
 		n.rn.ApplyTo(entries[len(entries)-1].Index)
 	}
 	return nil
+}
+
+// stateMachineImage serializes this node's applied history.
+//
+// The simulated state machine is the ordered list of commands applied, so its
+// image is those commands in order. Deterministic by construction, which is the
+// only property a snapshot has to have.
+func (n *node) stateMachineImage() []byte {
+	buf := make([]byte, 0, len(n.applied)*16)
+	buf = binary.AppendUvarint(buf, uint64(len(n.applied)))
+	for _, e := range n.applied {
+		buf = binary.AppendUvarint(buf, uint64(e.Index))
+		buf = binary.AppendUvarint(buf, uint64(e.Term))
+		buf = binary.AppendUvarint(buf, uint64(len(e.Command)))
+		buf = append(buf, e.Command...)
+	}
+	return buf
+}
+
+// restoreSnapshot rebuilds the simulated state machine from an image, which is
+// what happens when this node fell behind the start of the leader's log.
+func (n *node) restoreSnapshot(s *Simulator) error {
+	if n.crashed() {
+		return nil
+	}
+	snap, ok := n.rn.SnapshotToApply()
+	if !ok {
+		return nil
+	}
+
+	applied, err := decodeStateMachine(snap.Data)
+	if err != nil {
+		return fmt.Errorf("sim: node %d restoring snapshot at %d: %w",
+			n.id, snap.LastIncludedIndex, err)
+	}
+	n.applied = applied
+	n.restoredFrom = snap.LastIncludedIndex
+	s.trace.record(s.now, "restore %d from snapshot at %d", n.id, snap.LastIncludedIndex)
+	return nil
+}
+
+func decodeStateMachine(b []byte) ([]raft.LogEntry, error) {
+	count, read := binary.Uvarint(b)
+	if read <= 0 {
+		return nil, fmt.Errorf("truncated snapshot header")
+	}
+	b = b[read:]
+
+	out := make([]raft.LogEntry, 0, count)
+	for range count {
+		index, n := binary.Uvarint(b)
+		if n <= 0 {
+			return nil, fmt.Errorf("truncated entry index")
+		}
+		b = b[n:]
+		term, n := binary.Uvarint(b)
+		if n <= 0 {
+			return nil, fmt.Errorf("truncated entry term")
+		}
+		b = b[n:]
+		size, n := binary.Uvarint(b)
+		if n <= 0 || uint64(len(b[n:])) < size {
+			return nil, fmt.Errorf("truncated entry command")
+		}
+		b = b[n:]
+		cmd := append([]byte(nil), b[:size]...)
+		b = b[size:]
+		out = append(out, raft.LogEntry{
+			Index: raft.Index(index), Term: raft.Term(term), Command: cmd,
+		})
+	}
+	return out, nil
 }
 
 func (n *node) String() string {
