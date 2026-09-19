@@ -1,0 +1,140 @@
+syntax = "proto3";
+
+package kv.v1;
+
+import "raft.proto";
+
+option go_package = "github.com/sAchin-680/raftkv/proto/kvpb;kvpb";
+
+// ---------------------------------------------------------------------------
+// Client sessions
+// ---------------------------------------------------------------------------
+
+// Raft guarantees a command is applied at least once, not exactly once: a client
+// whose request times out cannot tell whether the entry committed, so it retries,
+// and the same command can end up in the log twice (§8 of the paper).
+//
+// Every write therefore carries a session. The state machine keeps the last
+// sequence number and response it saw per client, and replays the stored response
+// instead of re-applying a duplicate. Without this, a retried write is invisible
+// to the KV map (Set is idempotent) but still corrupts the *history* a
+// linearizability checker sees — which is exactly what Phase 3 is looking for.
+message Session {
+  uint64 client_id    = 1;
+  uint64 sequence_num = 2;
+}
+
+message RegisterRequest {}
+
+message RegisterResponse {
+  uint64 client_id = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Key/value operations
+// ---------------------------------------------------------------------------
+
+// Consistency level requested for a read.
+enum ReadConsistency {
+  READ_CONSISTENCY_UNSPECIFIED = 0;
+
+  // Read-index: the leader confirms it is still the leader with a round of
+  // heartbeats, waits for its state machine to catch up to the index that was
+  // committed at that moment, and only then reads. Linearizable.
+  READ_CONSISTENCY_LINEARIZABLE = 1;
+
+  // Read straight out of the local state machine, no coordination. Fast, and
+  // may return a value that is arbitrarily stale — a leader that has been
+  // partitioned away but does not know it yet will happily serve from it.
+  READ_CONSISTENCY_STALE = 2;
+}
+
+message GetRequest {
+  bytes           key         = 1;
+  ReadConsistency consistency = 2;
+}
+
+message GetResponse {
+  bytes value = 1;
+  bool  found = 2;
+
+  // The commit index this read was served at. Recorded in the operation history
+  // so a failed linearizability check can be traced back to a specific point in
+  // the log rather than just a wall-clock instant.
+  uint64 read_index = 3;
+}
+
+message SetRequest {
+  Session session = 1;
+  bytes   key     = 2;
+  bytes   value   = 3;
+}
+
+message SetResponse {
+  uint64 index = 1;  // log index at which the write committed
+}
+
+message DeleteRequest {
+  Session session = 1;
+  bytes   key     = 2;
+}
+
+message DeleteResponse {
+  uint64 index   = 1;
+  bool   existed = 2;
+}
+
+service KV {
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Set(SetRequest) returns (SetResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Cluster administration
+// ---------------------------------------------------------------------------
+
+// Attached as a gRPC error detail when a request reaches a node that is not the
+// leader, so a client can redirect in one hop instead of polling every peer.
+// leader_hint is 0 when the node does not currently know of a leader.
+message NotLeaderError {
+  uint64 leader_hint      = 1;
+  string leader_address   = 2;
+}
+
+message StatusRequest {}
+
+message StatusResponse {
+  uint64               node_id      = 1;
+  string               state        = 2;  // "follower" | "candidate" | "leader"
+  uint64               term         = 3;
+  uint64               leader_id    = 4;
+  uint64               commit_index = 5;
+  uint64               applied_index = 6;
+  uint64               last_index   = 7;
+  raft.v1.Configuration config      = 8;
+
+  // Leader only: the last index each peer is known to have matched. The gap
+  // between this and commit_index is replication lag, which is what the
+  // dashboard and the quorum alert are built on.
+  map<uint64, uint64> match_index = 9;
+}
+
+// Drives a joint-consensus membership change to completion: enter the joint
+// configuration, wait for it to commit, then leave it for the target
+// configuration. The call returns once the whole transition has committed.
+message ChangeMembershipRequest {
+  repeated uint64 voters   = 1;
+  repeated uint64 learners = 2;
+}
+
+message ChangeMembershipResponse {
+  raft.v1.Configuration config = 1;
+  uint64                index  = 2;
+}
+
+service Cluster {
+  rpc Status(StatusRequest) returns (StatusResponse);
+  rpc ChangeMembership(ChangeMembershipRequest) returns (ChangeMembershipResponse);
+}

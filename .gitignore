@@ -1,0 +1,25 @@
+# Personal planning, roadmaps and strategy notes — not part of the shipped project
+/.planning/
+
+# Build output
+/bin/
+/dist/
+
+# Test & simulation artifacts
+*.out
+*.test
+/coverage.*
+/testdata/tmp/
+/sim-failures/
+
+# Node data directories produced by raftd
+/data/
+*.bolt
+
+# Local environment
+.env
+.DS_Store
+
+# Editor
+.idea/
+*.swp
