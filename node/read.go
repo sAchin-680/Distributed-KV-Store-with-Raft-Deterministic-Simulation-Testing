@@ -50,6 +50,15 @@ func (n *Node) ReadIndex(ctx context.Context) (raft.Index, error) {
 	}
 }
 
+// appliedPollDivisor sets how often AwaitApplied re-checks, as a fraction of
+// the tick interval.
+//
+// Tied to the tick rather than fixed because the thing being waited for —
+// replication catching up — happens on the tick's timescale. A cluster
+// configured with slow ticks should not be polled at a fast one, and a fast
+// cluster should not wait a slow interval to notice it is ready.
+const appliedPollDivisor = 4
+
 // AwaitApplied blocks until the state machine has applied through index.
 //
 // Paired with ReadIndex this completes a linearizable read: the barrier says
@@ -73,7 +82,7 @@ func (n *Node) AwaitApplied(ctx context.Context, index raft.Index) error {
 				index, status.AppliedIndex, ctx.Err())
 		case <-n.doneCh:
 			return ErrStopped
-		case <-n.cfg.Clock.NewTimer(n.cfg.TickInterval / 4).C():
+		case <-n.cfg.Clock.NewTimer(n.cfg.TickInterval / appliedPollDivisor).C():
 		}
 	}
 }

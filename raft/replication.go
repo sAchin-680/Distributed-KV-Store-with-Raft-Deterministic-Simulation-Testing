@@ -75,12 +75,18 @@ func (r *RawNode) sendAppendWithRead(to NodeID, readID uint64) {
 		return
 	}
 
+	// A snapshot already on its way. Sending entries now would be pointless —
+	// the follower cannot check them against a log it is about to replace.
+	if pr.PendingSnapshot != 0 {
+		return
+	}
+
 	prevIndex := pr.Next - 1
 	prevTerm, err := r.log.term(prevIndex)
 	if err != nil {
-		// The entries this peer needs have been compacted away; it needs a
-		// snapshot rather than entries. Until snapshot transfer exists, leave
-		// it behind rather than send something it cannot check.
+		// The entries this peer needs have been compacted away, so there is
+		// nothing left to send it but the state machine itself.
+		r.sendSnapshot(to)
 		return
 	}
 
@@ -132,6 +138,29 @@ func (r *RawNode) handleAppendRequest(m Message) error {
 		r.becomeFollower(m.Term, m.From)
 	}
 	r.lead = m.From
+
+	// A stale append whose prevLogIndex is already below our commit index
+	// carries nothing that is not settled. Answer with what we have and leave
+	// the log alone.
+	//
+	// The network delivers messages late, and a leader that once had to send us
+	// entries from the start of the log will have moved on since. Without this
+	// guard those late messages reach the conflict scan, which cannot verify
+	// entries that have been compacted away — matchTerm reports "no match" for
+	// an index it simply no longer holds — so an entry that is merely *unknown*
+	// is reported as *conflicting*, and the log refuses it as an attempt to
+	// overwrite its committed prefix.
+	//
+	// Found by the simulator at seed 188, and only reachable once compaction
+	// exists: before that the conflict scan could still verify old entries and
+	// correctly found no conflict at all.
+	if m.PrevLogIndex < r.log.committed {
+		r.send(Message{
+			Type: MsgAppendResp, To: m.From,
+			Success: true, MatchIndex: r.log.committed, ReadID: m.ReadID,
+		})
+		return nil
+	}
 
 	lastNew, ok, err := r.log.maybeAppend(m.PrevLogIndex, m.PrevLogTerm, m.LeaderCommit, m.Entries)
 	if err != nil {
@@ -216,6 +245,24 @@ func (r *RawNode) handleAppendResponse(m Message) error {
 	if next < 1 {
 		next = 1
 	}
+
+	// Never back up below what this follower has already confirmed.
+	//
+	// Match is a fact the follower reported about itself; a rejection that would
+	// take us below it is necessarily stale. Without this floor a delayed
+	// rejection — one sent before Match advanced, or before a snapshot moved it
+	// forward — makes the leader resend entries the follower has already
+	// committed, and the follower correctly refuses them as an attempt to
+	// overwrite its committed prefix.
+	//
+	// Plain nextIndex decrementing hides this: a follower that matched would not
+	// have rejected in the first place. It only surfaces once responses can be
+	// delayed or duplicated and once snapshots can move Match in a single jump,
+	// which is why the simulator found it and ordinary testing did not.
+	if next <= pr.Match {
+		next = pr.Match + 1
+	}
+
 	if next < pr.Next {
 		pr.Next = next
 		r.sendAppend(m.From)

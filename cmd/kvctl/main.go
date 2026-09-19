@@ -134,6 +134,10 @@ func run() error {
 	return nil
 }
 
+// statusTimeout bounds each node's status call, so one unreachable node cannot
+// consume the whole command timeout and leave the rest unqueried.
+const statusTimeout = 2 * time.Second
+
 // printStatus asks every endpoint what it believes, rather than following the
 // leader. Disagreement between nodes is the interesting part — a node that
 // thinks someone else leads, or that is behind on commit index, is exactly what
@@ -146,7 +150,7 @@ func printStatus(ctx context.Context, client *kvserver.Client) error {
 
 	reachable := 0
 	for _, endpoint := range client.Endpoints() {
-		each, cancel := context.WithTimeout(ctx, 2*time.Second)
+		each, cancel := context.WithTimeout(ctx, statusTimeout)
 		status, err := client.Status(each, endpoint)
 		cancel()
 		if err != nil {

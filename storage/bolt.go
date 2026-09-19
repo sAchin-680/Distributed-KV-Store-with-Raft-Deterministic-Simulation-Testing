@@ -29,6 +29,7 @@ var (
 
 	keyHardState = []byte("hard")
 	keySnapshot  = []byte("snap")
+	keyFloor     = []byte("floor")
 )
 
 // Options configures a Bolt store.
@@ -71,11 +72,25 @@ type Bolt struct {
 	first raft.Index
 	last  raft.Index
 
-	// snapIndex and snapTerm answer for the entry at the snapshot boundary,
-	// which no longer exists in the log. An AppendEntries consistency check can
-	// legitimately reference exactly that index, so it has to be answerable.
+	// snapIndex and snapTerm describe the newest snapshot.
 	snapIndex raft.Index
 	snapTerm  raft.Term
+
+	// floorIndex and floorTerm describe the oldest entry still answerable: the
+	// last one discarded by compaction.
+	//
+	// Separate from the snapshot, and the separation is the whole point. Saving
+	// a snapshot does not discard entries — a leader keeps a tail past the
+	// snapshot point so slightly-behind followers can be repaired with entries
+	// — so the log floor sits *below* the snapshot boundary. Conflating them
+	// makes Compact believe it has already run and silently do nothing, which
+	// is exactly the bug that left the log growing for ever behind a snapshot
+	// that claimed to have shortened it.
+	//
+	// An AppendEntries consistency check can reference the floor itself, so its
+	// term has to survive the entry being discarded.
+	floorIndex raft.Index
+	floorTerm  raft.Term
 
 	hardState raft.HardState
 }
@@ -133,9 +148,16 @@ func (s *Bolt) init() error {
 			}
 			s.snapIndex, s.snapTerm = snap.LastIncludedIndex, snap.LastIncludedTerm
 		}
+		if raw := meta.Get(keyFloor); raw != nil {
+			index, term, err := decodeFloor(raw)
+			if err != nil {
+				return err
+			}
+			s.floorIndex, s.floorTerm = index, term
+		}
 
-		s.first = s.snapIndex + 1
-		s.last = s.snapIndex
+		s.first = s.floorIndex + 1
+		s.last = s.floorIndex
 		if k, _ := log.Cursor().Last(); k != nil {
 			s.last = decodeIndex(k)
 		}
@@ -176,8 +198,10 @@ func (s *Bolt) FirstIndex() raft.Index { return s.first }
 func (s *Bolt) LastIndex() raft.Index  { return s.last }
 
 func (s *Bolt) Term(i raft.Index) (raft.Term, error) {
-	if i == s.snapIndex && s.snapIndex > 0 {
-		return s.snapTerm, nil
+	// The floor is the last entry compaction discarded, and a consistency check
+	// can reference exactly it, so its term outlives the entry.
+	if i == s.floorIndex && s.floorIndex > 0 {
+		return s.floorTerm, nil
 	}
 	entry, err := s.GetEntry(i)
 	if err != nil {
@@ -253,13 +277,13 @@ func (s *Bolt) AppendEntries(entries []raft.LogEntry) error {
 
 	firstNew, lastNew := entries[0].Index, entries[len(entries)-1].Index
 
-	// Entirely covered by the snapshot: nothing left to store. Not an error — a
-	// leader can legitimately resend entries a follower has since compacted.
-	if lastNew <= s.snapIndex {
+	// Entirely below the floor: nothing left to store. Not an error — a leader
+	// can legitimately resend entries a follower has since compacted.
+	if lastNew <= s.floorIndex {
 		return nil
 	}
-	if firstNew <= s.snapIndex {
-		entries = entries[s.snapIndex+1-firstNew:]
+	if firstNew <= s.floorIndex {
+		entries = entries[s.floorIndex+1-firstNew:]
 		firstNew = entries[0].Index
 	}
 	if firstNew > s.last+1 {
@@ -297,7 +321,7 @@ func (s *Bolt) AppendEntries(entries []raft.LogEntry) error {
 
 	s.last = lastNew
 	if s.first > s.last {
-		s.first = s.snapIndex + 1
+		s.first = s.floorIndex + 1
 	}
 	return nil
 }
@@ -327,9 +351,12 @@ func (s *Bolt) SaveSnapshot(snap raft.Snapshot) error {
 		return err
 	}
 
-	// A snapshot that runs past our log replaces it entirely — the catch-up case
-	// where a follower was too far behind to repair with entries. One that lands
-	// inside our log leaves the tail intact.
+	// Saving a snapshot records it; discarding log entries is Compact's job.
+	// Keeping a tail of entries past the snapshot point lets a slightly-behind
+	// follower be repaired with entries instead of a whole state machine image.
+	//
+	// The exception is a snapshot that runs past our log, or disagrees with it
+	// at the boundary: our entries are stale, so the snapshot replaces them.
 	replaceLog := snap.LastIncludedIndex > s.last
 	if !replaceLog {
 		if term, terr := s.Term(snap.LastIncludedIndex); terr != nil || term != snap.LastIncludedTerm {
@@ -338,11 +365,17 @@ func (s *Bolt) SaveSnapshot(snap raft.Snapshot) error {
 	}
 
 	err = s.db.Update(func(tx *bolt.Tx) error {
-		if err := tx.Bucket(bucketMeta).Put(keySnapshot, raw); err != nil {
+		meta := tx.Bucket(bucketMeta)
+		if err := meta.Put(keySnapshot, raw); err != nil {
 			return fmt.Errorf("storage: writing snapshot: %w", err)
 		}
 		if !replaceLog {
 			return nil
+		}
+		// The log is being thrown away, so the floor moves to the snapshot.
+		if err := meta.Put(keyFloor,
+			encodeFloor(snap.LastIncludedIndex, snap.LastIncludedTerm)); err != nil {
+			return fmt.Errorf("storage: writing log floor: %w", err)
 		}
 		if err := tx.DeleteBucket(bucketLog); err != nil && !errors.Is(err, bolterrors.ErrBucketNotFound) {
 			return fmt.Errorf("storage: clearing log: %w", err)
@@ -356,9 +389,10 @@ func (s *Bolt) SaveSnapshot(snap raft.Snapshot) error {
 
 	s.snapIndex, s.snapTerm = snap.LastIncludedIndex, snap.LastIncludedTerm
 	if replaceLog {
+		s.floorIndex, s.floorTerm = snap.LastIncludedIndex, snap.LastIncludedTerm
 		s.last = snap.LastIncludedIndex
+		s.first = snap.LastIncludedIndex + 1
 	}
-	s.first = s.snapIndex + 1
 	return nil
 }
 
@@ -378,7 +412,7 @@ func (s *Bolt) LoadSnapshot() (raft.Snapshot, error) {
 
 func (s *Bolt) Compact(upto raft.Index) error {
 	switch {
-	case upto <= s.snapIndex:
+	case upto <= s.floorIndex:
 		return nil
 	case upto > s.last:
 		return fmt.Errorf("storage: compact to %d past last index %d", upto, s.last)
@@ -392,6 +426,9 @@ func (s *Bolt) Compact(upto raft.Index) error {
 	}
 
 	err = s.db.Update(func(tx *bolt.Tx) error {
+		if err := tx.Bucket(bucketMeta).Put(keyFloor, encodeFloor(upto, term)); err != nil {
+			return fmt.Errorf("storage: writing log floor: %w", err)
+		}
 		c := tx.Bucket(bucketLog).Cursor()
 		for k, _ := c.First(); k != nil && decodeIndex(k) <= upto; k, _ = c.Next() {
 			if err := c.Delete(); err != nil {
@@ -404,7 +441,7 @@ func (s *Bolt) Compact(upto raft.Index) error {
 		return err
 	}
 
-	s.snapIndex, s.snapTerm = upto, term
+	s.floorIndex, s.floorTerm = upto, term
 	s.first = upto + 1
 	return nil
 }
@@ -436,4 +473,26 @@ func encodeIndex(i raft.Index) []byte {
 
 func decodeIndex(k []byte) raft.Index {
 	return raft.Index(binary.BigEndian.Uint64(k))
+}
+
+// encodeFloor stores the last index discarded by compaction and its term, so a
+// consistency check reaching exactly that index can still be answered after the
+// entry itself is gone.
+func encodeFloor(index raft.Index, term raft.Term) []byte {
+	buf := make([]byte, 0, 2*binary.MaxVarintLen64)
+	buf = binary.AppendUvarint(buf, uint64(index))
+	buf = binary.AppendUvarint(buf, uint64(term))
+	return buf
+}
+
+func decodeFloor(b []byte) (raft.Index, raft.Term, error) {
+	index, n := binary.Uvarint(b)
+	if n <= 0 {
+		return 0, 0, fmt.Errorf("storage: truncated log floor index")
+	}
+	term, m := binary.Uvarint(b[n:])
+	if m <= 0 {
+		return 0, 0, fmt.Errorf("storage: truncated log floor term")
+	}
+	return raft.Index(index), raft.Term(term), nil
 }

@@ -63,6 +63,20 @@ type Config struct {
 	// Without a cap, a follower that is far behind provokes a single message
 	// the size of the entire log. Zero uses the default.
 	MaxEntriesPerMessage int
+
+	// SnapshotThreshold is how many log entries past the last snapshot are
+	// tolerated before ShouldSnapshot reports true. Zero disables snapshotting,
+	// which means the log grows without bound.
+	SnapshotThreshold uint64
+
+	// SnapshotCatchUpEntries is how many entries to retain behind a new
+	// snapshot, so a follower that is only slightly behind can still be repaired
+	// with entries rather than a whole state machine image.
+	SnapshotCatchUpEntries uint64
+
+	// SnapshotRetryHeartbeats is how many heartbeats pass before a snapshot
+	// whose reply never arrived is sent again. Zero uses the default.
+	SnapshotRetryHeartbeats int
 }
 
 func (c *Config) validate() error {
@@ -94,9 +108,22 @@ func (c *Config) validate() error {
 type Progress struct {
 	Match Index
 	Next  Index
+
+	// PendingSnapshot is the boundary of a snapshot currently in flight to this
+	// peer, or zero. It stops the leader re-sending a large image on every
+	// heartbeat while the first one is still travelling — to exactly the
+	// follower that is already struggling to keep up.
+	PendingSnapshot Index
+
+	// SnapshotTicks counts heartbeats since that snapshot was sent, so a lost
+	// reply eventually lets it be retried instead of stranding the follower.
+	SnapshotTicks int
 }
 
 func (p Progress) String() string {
+	if p.PendingSnapshot != 0 {
+		return fmt.Sprintf("{match=%d next=%d snapshot=%d}", p.Match, p.Next, p.PendingSnapshot)
+	}
 	return fmt.Sprintf("{match=%d next=%d}", p.Match, p.Next)
 }
 
@@ -149,6 +176,11 @@ type RawNode struct {
 	// their order is identical on every run of a seed.
 	pendingReads []*readRequest
 	readStates   []ReadState
+
+	// appliedSnapshot is a snapshot the driver must restore the state machine
+	// from. The core can install one into the log; only the driver can install
+	// one into the application.
+	appliedSnapshot *Snapshot
 
 	msgs []Message
 }
@@ -422,6 +454,7 @@ func (r *RawNode) tickHeartbeat() error {
 		return nil
 	}
 	r.heartbeatElapsed = 0
+	r.expirePendingSnapshots()
 	r.broadcastAppend()
 
 	// Re-ask for confirmation of any read still waiting.
@@ -532,6 +565,10 @@ func (r *RawNode) dispatch(m Message) error {
 		return r.handleAppendRequest(m)
 	case MsgAppendResp:
 		return r.handleAppendResponse(m)
+	case MsgSnapshotReq:
+		return r.handleSnapshotRequest(m)
+	case MsgSnapshotResp:
+		return r.handleSnapshotResponse(m)
 	default:
 		return fmt.Errorf("raft: unhandled message type %s: %w", m.Type, ErrIgnoredMessage)
 	}

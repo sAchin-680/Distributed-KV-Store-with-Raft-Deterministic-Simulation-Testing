@@ -16,6 +16,7 @@
 package sim
 
 import (
+	"errors"
 	"fmt"
 	"math/rand"
 	"slices"
@@ -50,6 +51,19 @@ type Config struct {
 	// that proves very little.
 	WriteInterval int64
 
+	// SnapshotThreshold is how many log entries past the last snapshot are
+	// tolerated before a node compacts. Deliberately small by default: the point
+	// is to make snapshotting, compaction and snapshot transfer happen
+	// constantly, so that a run explores them rather than mentioning them.
+	SnapshotThreshold uint64
+
+	// SnapshotCatchUpEntries is how many entries survive a compaction.
+	//
+	// Also deliberately small. A large tail means a returning follower is
+	// almost always repairable with entries, and the snapshot-transfer path —
+	// the one with the interesting failure modes — would hardly ever run.
+	SnapshotCatchUpEntries uint64
+
 	Faults Faults
 
 	// Verbose keeps the full event trace in memory for printing.
@@ -60,15 +74,17 @@ type Config struct {
 // virtual seconds.
 func DefaultConfig(seed int64) Config {
 	return Config{
-		Seed:          seed,
-		Nodes:         5,
-		Duration:      30_000,
-		TickInterval:  10,
-		ElectionTick:  10,
-		HeartbeatTick: 2,
-		PreVote:       true,
-		WriteInterval: 20,
-		Faults:        DefaultFaults(),
+		Seed:                   seed,
+		Nodes:                  5,
+		Duration:               30_000,
+		TickInterval:           10,
+		ElectionTick:           10,
+		HeartbeatTick:          2,
+		PreVote:                true,
+		WriteInterval:          20,
+		SnapshotThreshold:      50,
+		SnapshotCatchUpEntries: 10,
+		Faults:                 DefaultFaults(),
 	}
 }
 
@@ -91,6 +107,9 @@ func (c *Config) withDefaults() {
 	if c.Faults.FaultInterval == 0 {
 		c.Faults.FaultInterval = 250
 	}
+	if c.SnapshotThreshold == 0 {
+		c.SnapshotThreshold = 50
+	}
 	if c.Faults.MaxLatency == 0 {
 		c.Faults.MaxLatency = c.Faults.MinLatency
 	}
@@ -110,6 +129,8 @@ type Report struct {
 	Crashes      int
 	Restarts     int
 	Partitions   int
+	Snapshots    int
+	SnapshotSent int
 	MessagesSent int
 	Dropped      int
 	Duplicated   int
@@ -128,9 +149,10 @@ func (r *Report) String() string {
 	return fmt.Sprintf(
 		"seed %d: %s — %d events in %s (%dms virtual), %d entries committed across "+
 			"%d leader terms, %d crashes, %d restarts, %d partitions, "+
-			"%d msgs (%d dropped, %d duplicated), trace %016x",
+			"%d snapshots taken, %d sent, %d msgs (%d dropped, %d duplicated), trace %016x",
 		r.Seed, status, r.Events, r.Elapsed.Round(time.Microsecond), r.VirtualTime,
 		r.Committed, r.LeaderTerms, r.Crashes, r.Restarts, r.Partitions,
+		r.Snapshots, r.SnapshotSent,
 		r.MessagesSent, r.Dropped, r.Duplicated, r.TraceHash)
 }
 
@@ -154,6 +176,7 @@ type Simulator struct {
 	writeSeq int
 	stats    struct {
 		sent, dropped, duplicated, partitions int
+		snapshots, snapshotsSent              int
 	}
 }
 
@@ -193,11 +216,13 @@ func New(cfg Config) (*Simulator, error) {
 
 func (s *Simulator) raftConfig() raft.Config {
 	return raft.Config{
-		ElectionTick:  s.cfg.ElectionTick,
-		HeartbeatTick: s.cfg.HeartbeatTick,
-		PreVote:       s.cfg.PreVote,
-		Rand:          simRand{s},
-		Bootstrap:     s.conf,
+		ElectionTick:           s.cfg.ElectionTick,
+		HeartbeatTick:          s.cfg.HeartbeatTick,
+		PreVote:                s.cfg.PreVote,
+		Rand:                   simRand{s},
+		Bootstrap:              s.conf,
+		SnapshotThreshold:      s.cfg.SnapshotThreshold,
+		SnapshotCatchUpEntries: s.cfg.SnapshotCatchUpEntries,
 	}
 }
 
@@ -278,6 +303,8 @@ func (s *Simulator) report(started time.Time, v *Violation) *Report {
 		Crashes:      crashes,
 		Restarts:     restarts,
 		Partitions:   s.stats.partitions,
+		Snapshots:    s.stats.snapshots,
+		SnapshotSent: s.stats.snapshotsSent,
 		MessagesSent: s.stats.sent,
 		Dropped:      s.stats.dropped,
 		Duplicated:   s.stats.duplicated,
@@ -354,9 +381,35 @@ func (s *Simulator) after(n *node) error {
 		return nil
 	}
 	for _, m := range n.rn.Messages() {
+		if m.Type == raft.MsgSnapshotReq {
+			s.stats.snapshotsSent++
+		}
 		s.route(m)
 	}
-	return n.drainApplied()
+	if err := n.restoreSnapshot(s); err != nil {
+		return err
+	}
+	if err := n.drainApplied(); err != nil {
+		return err
+	}
+	return s.maybeSnapshot(n)
+}
+
+// maybeSnapshot compacts a node's log once it has grown past the threshold.
+func (s *Simulator) maybeSnapshot(n *node) error {
+	if n.crashed() || !n.rn.ShouldSnapshot() {
+		return nil
+	}
+	snap, err := n.rn.CreateSnapshot(n.stateMachineImage())
+	if err != nil {
+		if errors.Is(err, raft.ErrNothingToSnapshot) || errors.Is(err, raft.ErrSnapshotOutOfDate) {
+			return nil
+		}
+		return fmt.Errorf("sim: node %d creating snapshot: %w", n.id, err)
+	}
+	s.stats.snapshots++
+	s.trace.record(s.now, "snapshot %d at %d", n.id, snap.LastIncludedIndex)
+	return nil
 }
 
 func (s *Simulator) applyCrash(ev *event) error {

@@ -44,8 +44,53 @@ type GRPCConfig struct {
 	// DialTimeout bounds the initial connection attempt to a peer.
 	DialTimeout time.Duration
 
+	// Keepalive is how often to probe an idle connection, and KeepaliveTimeout
+	// how long to wait for the answer.
+	//
+	// These are coupled to the election timeout, which is why they are settings
+	// rather than constants. A machine that is killed rather than shut down
+	// leaves a connection that looks healthy until a probe fails, so detection
+	// takes Keepalive + KeepaliveTimeout. Set that longer than the election
+	// timeout and the cluster has already failed over before the transport
+	// notices — which is survivable, but means every such failure costs a
+	// leader change that need not have happened.
+	Keepalive        time.Duration
+	KeepaliveTimeout time.Duration
+
+	// ReconnectMaxDelay caps the exponential backoff between connection
+	// attempts.
+	//
+	// Capped low on purpose. A peer that has been unreachable for a while is
+	// exactly the one about to come back during a rolling restart, and a
+	// minutes-long backoff would extend every rollout by the time it takes to
+	// notice each pod return.
+	ReconnectMaxDelay time.Duration
+
+	// StreamRetryDelay paces reopening a stream whose connection survived.
+	// Only a pacing guard — gRPC already backs off the connection itself.
+	StreamRetryDelay time.Duration
+
 	Logger *slog.Logger
 }
+
+// Defaults, chosen against a default election timeout of about one second.
+const (
+	defaultKeepalive         = 10 * time.Second
+	defaultKeepaliveTimeout  = 3 * time.Second
+	defaultReconnectMaxDelay = 3 * time.Second
+	defaultStreamRetryDelay  = 200 * time.Millisecond
+	defaultDialTimeout       = 5 * time.Second
+
+	// minKeepaliveInterval is what the server will tolerate from a client
+	// before treating its probes as abusive. Must not exceed the client's own
+	// Keepalive or the server starts rejecting its peers' probes.
+	minKeepaliveInterval = 5 * time.Second
+
+	// reconnectBaseDelay and reconnectMultiplier shape the backoff curve.
+	reconnectBaseDelay  = 100 * time.Millisecond
+	reconnectMultiplier = 1.6
+	reconnectJitter     = 0.2
+)
 
 func (c *GRPCConfig) withDefaults() {
 	if c.InboxSize == 0 {
@@ -55,7 +100,19 @@ func (c *GRPCConfig) withDefaults() {
 		c.OutboxSize = 256
 	}
 	if c.DialTimeout == 0 {
-		c.DialTimeout = 5 * time.Second
+		c.DialTimeout = defaultDialTimeout
+	}
+	if c.Keepalive == 0 {
+		c.Keepalive = defaultKeepalive
+	}
+	if c.KeepaliveTimeout == 0 {
+		c.KeepaliveTimeout = defaultKeepaliveTimeout
+	}
+	if c.ReconnectMaxDelay == 0 {
+		c.ReconnectMaxDelay = defaultReconnectMaxDelay
+	}
+	if c.StreamRetryDelay == 0 {
+		c.StreamRetryDelay = defaultStreamRetryDelay
 	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()
@@ -120,11 +177,11 @@ func NewGRPC(cfg GRPCConfig) (*GRPC, error) {
 		grpc.KeepaliveParams(keepalive.ServerParameters{
 			// Detect a peer that has vanished without closing its connection —
 			// the usual outcome of a machine being killed rather than shut down.
-			Time:    10 * time.Second,
-			Timeout: 3 * time.Second,
+			Time:    cfg.Keepalive,
+			Timeout: cfg.KeepaliveTimeout,
 		}),
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
-			MinTime:             5 * time.Second,
+			MinTime:             minKeepaliveInterval,
 			PermitWithoutStream: true,
 		}),
 	)
@@ -341,18 +398,15 @@ func (pc *peerConn) run() {
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithConnectParams(grpc.ConnectParams{
 			Backoff: backoff.Config{
-				BaseDelay:  100 * time.Millisecond,
-				Multiplier: 1.6,
-				Jitter:     0.2,
-				// Capped low: a peer that has been down for a while is exactly
-				// the one about to come back during a rolling restart, and
-				// waiting two minutes to notice would extend every rollout.
-				MaxDelay: 3 * time.Second,
+				BaseDelay:  reconnectBaseDelay,
+				Multiplier: reconnectMultiplier,
+				Jitter:     reconnectJitter,
+				MaxDelay:   pc.t.cfg.ReconnectMaxDelay,
 			},
 		}),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time:                10 * time.Second,
-			Timeout:             3 * time.Second,
+			Time:                pc.t.cfg.Keepalive,
+			Timeout:             pc.t.cfg.KeepaliveTimeout,
 			PermitWithoutStream: true,
 		}),
 	)
@@ -380,7 +434,7 @@ func (pc *peerConn) run() {
 			pc.log.Debug("stream ended, reconnecting", "error", err)
 			// gRPC handles connection backoff; this only paces stream retries.
 			select {
-			case <-time.After(200 * time.Millisecond):
+			case <-time.After(pc.t.cfg.StreamRetryDelay):
 			case <-pc.done:
 				return
 			}

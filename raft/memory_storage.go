@@ -162,21 +162,24 @@ func (m *MemoryStorage) SaveSnapshot(snap Snapshot) error {
 	}
 	m.snapshot = snap.Clone()
 
-	// A snapshot that covers entries we hold leaves the log's tail intact; one
-	// that runs past our log replaces it entirely, which is the catch-up case
-	// where a follower was too far behind to be repaired with entries.
+	// Saving a snapshot records it; discarding log entries is Compact's job.
+	//
+	// The separation matters. A leader that compacted to the snapshot point the
+	// moment it took one would have to send the whole state machine to any
+	// follower even slightly behind. Keeping a tail of entries past the snapshot
+	// lets those followers be repaired with entries, which is far cheaper.
+	//
+	// The exception is a snapshot that runs past our log, or that disagrees with
+	// it at the boundary. That is the catch-up case: our entries are stale or
+	// missing, so the snapshot replaces them outright.
 	if snap.LastIncludedIndex <= m.LastIndex() &&
 		m.ents[snap.LastIncludedIndex-m.offset()].Term == snap.LastIncludedTerm {
-		m.ents = append([]LogEntry{{
-			Index: snap.LastIncludedIndex,
-			Term:  snap.LastIncludedTerm,
-		}}, m.ents[snap.LastIncludedIndex-m.offset()+1:]...)
-	} else {
-		m.ents = []LogEntry{{
-			Index: snap.LastIncludedIndex,
-			Term:  snap.LastIncludedTerm,
-		}}
+		return nil
 	}
+	m.ents = []LogEntry{{
+		Index: snap.LastIncludedIndex,
+		Term:  snap.LastIncludedTerm,
+	}}
 	return nil
 }
 

@@ -65,6 +65,20 @@ type StateMachine interface {
 	Apply(entry raft.LogEntry) (any, error)
 }
 
+// Snapshotter is a state machine that can be captured and rebuilt.
+//
+// Optional: a node whose state machine does not implement it simply never
+// compacts its log, which is correct but means the log grows without bound and
+// every restart replays the whole history of the cluster.
+//
+// Snapshot must be deterministic in the strong sense — two nodes holding the
+// same state must produce identical bytes — or replicas look divergent when
+// they are not.
+type Snapshotter interface {
+	Snapshot() ([]byte, error)
+	Restore(data []byte, appliedIndex raft.Index) error
+}
+
 // Config configures a node.
 type Config struct {
 	ID      raft.NodeID
@@ -90,6 +104,14 @@ type Config struct {
 
 	// ProposeBuffer bounds how many proposals can be waiting for the run loop.
 	ProposeBuffer int
+
+	// SnapshotThreshold is how many log entries past the last snapshot are
+	// tolerated before one is taken. Zero disables snapshotting.
+	SnapshotThreshold uint64
+
+	// SnapshotCatchUpEntries is how many entries to keep behind a new snapshot
+	// so a slightly-behind follower can still be repaired with entries.
+	SnapshotCatchUpEntries uint64
 
 	Logger *slog.Logger
 
@@ -208,15 +230,17 @@ func Start(cfg Config) (*Node, error) {
 	}
 
 	rn, err := raft.NewRawNode(raft.Config{
-		ID:                   cfg.ID,
-		Storage:              cfg.Storage,
-		ElectionTick:         cfg.ElectionTick,
-		HeartbeatTick:        cfg.HeartbeatTick,
-		PreVote:              cfg.PreVote,
-		Rand:                 cfg.Rand,
-		Bootstrap:            raft.NewConfiguration(voters),
-		MaxEntriesPerMessage: cfg.MaxEntriesPerMessage,
-		MaxApplyEntries:      cfg.MaxApplyEntries,
+		ID:                     cfg.ID,
+		Storage:                cfg.Storage,
+		ElectionTick:           cfg.ElectionTick,
+		HeartbeatTick:          cfg.HeartbeatTick,
+		PreVote:                cfg.PreVote,
+		Rand:                   cfg.Rand,
+		Bootstrap:              raft.NewConfiguration(voters),
+		MaxEntriesPerMessage:   cfg.MaxEntriesPerMessage,
+		MaxApplyEntries:        cfg.MaxApplyEntries,
+		SnapshotThreshold:      cfg.SnapshotThreshold,
+		SnapshotCatchUpEntries: cfg.SnapshotCatchUpEntries,
 	})
 	if err != nil {
 		return nil, err
@@ -235,6 +259,10 @@ func Start(cfg Config) (*Node, error) {
 		lastTerm:     rn.Term(),
 		stopCh:       make(chan struct{}),
 		doneCh:       make(chan struct{}),
+	}
+
+	if err := n.restoreFromDisk(); err != nil {
+		return nil, err
 	}
 
 	go n.run()
@@ -324,7 +352,17 @@ func (n *Node) flush() error {
 
 	n.resolveReads()
 
+	// A snapshot that arrived replaces the state machine wholesale, so it has
+	// to be restored before any entry is applied on top of it.
+	if err := n.restoreSnapshot(); err != nil {
+		return err
+	}
+
 	if err := n.applyCommitted(); err != nil {
+		return err
+	}
+
+	if err := n.maybeSnapshot(); err != nil {
 		return err
 	}
 
@@ -368,6 +406,108 @@ func (n *Node) applyCommitted() error {
 		}
 		n.rn.ApplyTo(entries[len(entries)-1].Index)
 	}
+	return nil
+}
+
+// restoreFromDisk rebuilds the state machine from this node's own snapshot, at
+// startup.
+//
+// A restarting node resumes applying from its persisted applied index, not from
+// the start of the log: the entries below that point were folded into a snapshot
+// and compacted away. So the state machine has to be rebuilt from that snapshot
+// first, or the node comes back holding only whatever the log still has — a
+// fraction of its state, silently.
+//
+// Runs before the run loop starts, so nothing can observe the half-built state.
+func (n *Node) restoreFromDisk() error {
+	_, snap, err := n.cfg.Storage.InitialState()
+	if err != nil {
+		return fmt.Errorf("node: reading initial state: %w", err)
+	}
+	if snap.IsEmpty() {
+		return nil
+	}
+
+	snapshotter, ok := n.cfg.StateMachine.(Snapshotter)
+	if !ok {
+		return fmt.Errorf("node: storage holds a snapshot at index %d but the "+
+			"state machine cannot restore from one, so this node cannot recover "+
+			"its state", snap.LastIncludedIndex)
+	}
+	if err := snapshotter.Restore(snap.Data, snap.LastIncludedIndex); err != nil {
+		return fmt.Errorf("node: restoring snapshot at index %d: %w",
+			snap.LastIncludedIndex, err)
+	}
+
+	n.log.Info("restored state machine from disk",
+		"index", uint64(snap.LastIncludedIndex),
+		"term", uint64(snap.LastIncludedTerm),
+		"bytes", len(snap.Data))
+	return nil
+}
+
+// restoreSnapshot rebuilds the state machine from a snapshot the leader sent,
+// which happens when this node fell so far behind that the entries it needed
+// had already been compacted away.
+func (n *Node) restoreSnapshot() error {
+	snap, ok := n.rn.SnapshotToApply()
+	if !ok {
+		return nil
+	}
+
+	snapshotter, ok := n.cfg.StateMachine.(Snapshotter)
+	if !ok {
+		// The log has been replaced by an image this node cannot read, so it
+		// can never reach a state consistent with the rest of the cluster.
+		// Continuing would mean serving from a state machine that is silently
+		// wrong, which is worse than stopping.
+		return fmt.Errorf("received a snapshot at index %d but the state machine "+
+			"cannot restore from one", snap.LastIncludedIndex)
+	}
+
+	if err := snapshotter.Restore(snap.Data, snap.LastIncludedIndex); err != nil {
+		return fmt.Errorf("restoring snapshot at index %d: %w", snap.LastIncludedIndex, err)
+	}
+
+	// Proposals waiting on indexes the snapshot swallowed can never be
+	// answered: their entries are gone, replaced by an image that may or may
+	// not contain them.
+	n.failPending(ErrProposalDropped)
+
+	n.log.Info("restored from snapshot",
+		"index", uint64(snap.LastIncludedIndex),
+		"term", uint64(snap.LastIncludedTerm),
+		"bytes", len(snap.Data))
+	return nil
+}
+
+// maybeSnapshot folds the log into the state machine once it has grown enough.
+func (n *Node) maybeSnapshot() error {
+	if !n.rn.ShouldSnapshot() {
+		return nil
+	}
+	snapshotter, ok := n.cfg.StateMachine.(Snapshotter)
+	if !ok {
+		return nil
+	}
+
+	data, err := snapshotter.Snapshot()
+	if err != nil {
+		return fmt.Errorf("capturing the state machine: %w", err)
+	}
+
+	snap, err := n.rn.CreateSnapshot(data)
+	if err != nil {
+		if errors.Is(err, raft.ErrNothingToSnapshot) || errors.Is(err, raft.ErrSnapshotOutOfDate) {
+			return nil
+		}
+		return fmt.Errorf("creating snapshot: %w", err)
+	}
+
+	n.log.Info("took snapshot",
+		"index", uint64(snap.LastIncludedIndex),
+		"term", uint64(snap.LastIncludedTerm),
+		"bytes", len(data))
 	return nil
 }
 

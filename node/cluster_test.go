@@ -38,6 +38,9 @@ type cluster struct {
 	addrs   map[raft.NodeID]string
 	dbPaths map[raft.NodeID]string
 
+	snapshotThreshold uint64
+	snapshotCatchUp   uint64
+
 	// dbs holds the live handle per node. Restarting has to close the old one
 	// before reopening: bbolt takes an exclusive file lock, so a stale handle
 	// makes the restart fail with a lock timeout. That lock is deliberate — it
@@ -67,6 +70,16 @@ func reservePorts(t *testing.T, n int) []string {
 
 func newCluster(t *testing.T, size int) *cluster {
 	t.Helper()
+	return newClusterWithSnapshots(t, size, 0, 0)
+}
+
+// newClusterWithSnapshots builds a cluster that compacts its log.
+//
+// The threshold is deliberately tiny in tests. Real deployments compact after
+// thousands of entries; making it happen after a handful is what lets a test
+// reach the snapshot-transfer path in under a second.
+func newClusterWithSnapshots(t *testing.T, size int, threshold, catchUp uint64) *cluster {
+	t.Helper()
 
 	addrs := reservePorts(t, size)
 	peers := make([]transport.Peer, size)
@@ -76,14 +89,16 @@ func newCluster(t *testing.T, size int) *cluster {
 
 	dir := t.TempDir()
 	c := &cluster{
-		t:          t,
-		nodes:      make(map[raft.NodeID]*node.Node, size),
-		kv:         make(map[raft.NodeID]*kvstore.Store, size),
-		peers:      peers,
-		addrs:      make(map[raft.NodeID]string, size),
-		dbPaths:    make(map[raft.NodeID]string, size),
-		dbs:        make(map[raft.NodeID]*storage.Bolt, size),
-		transports: make(map[raft.NodeID]*transport.GRPC, size),
+		t:                 t,
+		nodes:             make(map[raft.NodeID]*node.Node, size),
+		kv:                make(map[raft.NodeID]*kvstore.Store, size),
+		peers:             peers,
+		addrs:             make(map[raft.NodeID]string, size),
+		dbPaths:           make(map[raft.NodeID]string, size),
+		dbs:               make(map[raft.NodeID]*storage.Bolt, size),
+		transports:        make(map[raft.NodeID]*transport.GRPC, size),
+		snapshotThreshold: threshold,
+		snapshotCatchUp:   catchUp,
 	}
 
 	for i, p := range peers {
@@ -115,11 +130,13 @@ func newCluster(t *testing.T, size int) *cluster {
 			// 30ms ticks give a 300–600ms election timeout: slow enough that a
 			// loaded CI machine does not trigger spurious elections, fast enough
 			// that the test finishes.
-			TickInterval:  30 * time.Millisecond,
-			ElectionTick:  10,
-			HeartbeatTick: 2,
-			PreVote:       true,
-			Logger:        quiet(),
+			TickInterval:           30 * time.Millisecond,
+			ElectionTick:           10,
+			HeartbeatTick:          2,
+			PreVote:                true,
+			Logger:                 quiet(),
+			SnapshotThreshold:      threshold,
+			SnapshotCatchUpEntries: catchUp,
 		})
 		if err != nil {
 			t.Fatalf("starting node %d: %v", p.ID, err)
@@ -184,6 +201,8 @@ func (c *cluster) restart(id raft.NodeID) {
 		ID: id, Peers: c.peers, Storage: db, Transport: tr, StateMachine: sm,
 		TickInterval: 30 * time.Millisecond, ElectionTick: 10, HeartbeatTick: 2,
 		PreVote: true, Logger: quiet(),
+		SnapshotThreshold:      c.snapshotThreshold,
+		SnapshotCatchUpEntries: c.snapshotCatchUp,
 	})
 	if err != nil {
 		c.t.Fatalf("restarting node %d: %v", id, err)
@@ -657,5 +676,127 @@ func TestReadsWorkOnASingleNodeCluster(t *testing.T) {
 	}
 	if index == 0 {
 		t.Error("read index is 0; the leader's no-op never committed")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Snapshotting
+// ---------------------------------------------------------------------------
+
+// A follower that falls behind the start of the leader's log can no longer be
+// repaired with entries, because those entries are gone. It gets the state
+// machine instead.
+func TestFollowerTooFarBehindIsCaughtUpBySnapshot(t *testing.T) {
+	c := newClusterWithSnapshots(t, 3, 20, 5)
+	leader, _ := c.awaitLeader(15 * time.Second)
+
+	var victim raft.NodeID
+	for _, id := range c.ids {
+		if id != leader {
+			victim = id
+			break
+		}
+	}
+
+	// Take it down and write far more than the snapshot threshold, so the
+	// entries it needs are compacted away while it is gone.
+	c.shutdown(victim)
+	for i := range 80 {
+		if err := c.set(leader, fmt.Sprintf("k-%d", i), "v"); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+
+	leaderStatus := c.status(leader)
+	if leaderStatus.CommitIndex < 80 {
+		t.Fatalf("setup: only committed %d", leaderStatus.CommitIndex)
+	}
+
+	c.restart(victim)
+
+	// It has to come back via a snapshot, then keep up with entries.
+	deadline := time.After(25 * time.Second)
+	for c.kv[victim].Len() < 80 {
+		select {
+		case <-deadline:
+			t.Fatalf("restarted node holds %d of 80 keys\n%s", c.kv[victim].Len(), c.dump())
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+
+	for i := range 80 {
+		want := fmt.Sprintf("k-%d", i)
+		if _, ok := c.kv[victim].Get([]byte(want)); !ok {
+			t.Fatalf("%s is missing after catching up by snapshot", want)
+		}
+	}
+
+	// And it must keep working afterwards.
+	if err := c.set(leader, "after", "y"); err != nil {
+		t.Fatalf("write after catch-up: %v", err)
+	}
+	deadline = time.After(10 * time.Second)
+	for {
+		if _, ok := c.kv[victim].Get([]byte("after")); ok {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("the caught-up node stopped receiving entries")
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
+// Compaction has to actually discard entries, or nothing has been gained.
+func TestSnapshottingCompactsTheLog(t *testing.T) {
+	c := newClusterWithSnapshots(t, 1, 20, 5)
+	leader, _ := c.awaitLeader(10 * time.Second)
+
+	for i := range 60 {
+		if err := c.set(leader, fmt.Sprintf("k-%d", i), "v"); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+
+	db := c.dbs[leader]
+	if first := db.FirstIndex(); first <= 1 {
+		t.Errorf("first index is %d after 60 writes with a threshold of 20; "+
+			"the log was never compacted", first)
+	}
+	// The state machine still holds everything, despite the log not doing so.
+	if got := c.kv[leader].Len(); got != 60 {
+		t.Errorf("state machine holds %d keys, want 60", got)
+	}
+}
+
+// A node restarting from its own snapshot must not replay from the beginning —
+// the entries are gone — and must come back with its state intact.
+func TestNodeRestoresFromItsOwnSnapshot(t *testing.T) {
+	c := newClusterWithSnapshots(t, 1, 20, 5)
+	leader, _ := c.awaitLeader(10 * time.Second)
+
+	for i := range 60 {
+		if err := c.set(leader, fmt.Sprintf("k-%d", i), "v"); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+
+	c.restart(leader)
+	c.awaitLeader(15 * time.Second)
+
+	deadline := time.After(15 * time.Second)
+	for c.kv[leader].Len() < 60 {
+		select {
+		case <-deadline:
+			t.Fatalf("restored %d of 60 keys from its own snapshot\n%s",
+				c.kv[leader].Len(), c.dump())
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	for i := range 60 {
+		if _, ok := c.kv[leader].Get(fmt.Appendf(nil, "k-%d", i)); !ok {
+			t.Fatalf("k-%d was lost across a snapshot restart", i)
+		}
 	}
 }

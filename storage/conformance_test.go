@@ -395,3 +395,52 @@ func TestAppendBelowSnapshotBoundaryIsIgnored(t *testing.T) {
 		}
 	})
 }
+
+// Saving a snapshot must not block a later compaction to a lower index.
+//
+// A leader keeps a tail of entries past the snapshot point so slightly-behind
+// followers can be repaired with entries rather than a whole state machine
+// image. That means the log floor sits *below* the snapshot boundary, and a
+// store that treats the two as one thing decides Compact has already run and
+// silently does nothing — leaving the log growing for ever behind a snapshot
+// that claimed to have shortened it.
+func TestCompactBelowTheSnapshotBoundaryStillWorks(t *testing.T) {
+	eachStorage(t, func(t *testing.T, s raft.Storage) {
+		ents := make([]raft.LogEntry, 0, 60)
+		for i := 1; i <= 60; i++ {
+			ents = append(ents, raft.LogEntry{Index: raft.Index(i), Term: 1})
+		}
+		mustAppend(t, s, ents)
+
+		if err := s.SaveSnapshot(raft.Snapshot{
+			LastIncludedIndex: 60, LastIncludedTerm: 1,
+			Config: raft.NewConfiguration([]raft.NodeID{1}),
+		}); err != nil {
+			t.Fatalf("SaveSnapshot: %v", err)
+		}
+		// Saving alone keeps the entries, so a follower one entry behind is
+		// still repairable without shipping the whole state machine.
+		if got := s.FirstIndex(); got != 1 {
+			t.Errorf("FirstIndex = %d after SaveSnapshot alone, want 1", got)
+		}
+
+		// Now compact behind the snapshot, keeping a tail of five.
+		if err := s.Compact(55); err != nil {
+			t.Fatalf("Compact: %v", err)
+		}
+		if got := s.FirstIndex(); got != 56 {
+			t.Errorf("FirstIndex = %d, want 56 — compaction below the snapshot "+
+				"boundary did nothing", got)
+		}
+		if got := s.LastIndex(); got != 60 {
+			t.Errorf("LastIndex = %d, want 60 — the retained tail was lost", got)
+		}
+		// The floor itself must still answer, for the consistency check.
+		if term, err := s.Term(55); err != nil || term != 1 {
+			t.Errorf("Term(55) = %d, %v; want 1, nil at the compaction boundary", term, err)
+		}
+		if _, err := s.GetEntry(54); !errors.Is(err, raft.ErrCompacted) {
+			t.Errorf("GetEntry(54) = %v, want ErrCompacted", err)
+		}
+	})
+}

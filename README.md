@@ -17,9 +17,9 @@ When a randomized run finds a safety violation, it prints one number. That numbe
 is enough for anyone to replay the identical failure, byte for byte, forever.
 
 > **Status:** in active development. The store works end to end — a real cluster
-> elects a leader, replicates writes to durable storage, and serves linearizable
-> reads to clients over gRPC. Snapshotting and membership changes come next. See
-> [Status](#status) for what is built and what is coming.
+> elects a leader, replicates writes to durable storage, compacts its log into
+> snapshots, and serves linearizable reads to clients over gRPC. Membership
+> changes come next. See [Status](#status) for what is built and what is coming.
 
 ```text
                      ┌───────────────────────────────────────────────┐
@@ -85,10 +85,14 @@ no safety violations
 | | |
 | --- | --- |
 | Seeds | 10,000 |
-| Simulated events | 2,092,853,788 |
-| Entries committed | 13,535,461 |
-| Cluster time simulated | **83.3 hours in 4 minutes** — 1,235× real time |
+| Simulated events | 2,031,338,664 |
+| Entries committed | 12,932,095 |
+| Cluster time simulated | **83.3 hours in 4 minutes** — 1,206× real time |
 | Safety violations | **0** |
+
+Snapshotting is exercised throughout: a typical run takes over a hundred
+snapshots and transfers roughly a hundred of them to followers that had fallen
+behind the start of the leader's log.
 
 Checked after every single event: at most one leader per term, no committed entry
 ever changes, commit index never decreases, applied never exceeds committed. At
@@ -112,6 +116,25 @@ safety violation [committed-entries-never-change] at t=12633ms (seed 2):
 Identical event count, identical trace hash, identical violation at the same
 index and the same millisecond — on any machine, indefinitely. A randomized test
 that cannot do this reports failures nobody can act on.
+
+### Bugs it found
+
+Enabling snapshotting made the simulator fail within the first twenty seeds.
+Three were real defects, each only reachable once compaction existed:
+
+| Bug | Why it hid | Consequence |
+| --- | --- | --- |
+| A delayed `AppendEntries` below the commit index was scanned for conflicts | Before compaction the scan could verify the old entries and correctly found none | An entry that is merely *unknown* is reported as *conflicting*, and the node refuses it as an attempt to overwrite its committed prefix |
+| The bbolt store conflated the log floor with the snapshot boundary | They are the same until a leader keeps a tail of entries past the snapshot | `Compact` decides it has already run and silently does nothing — the log grows for ever behind a snapshot that claimed to have shortened it |
+| A node restarting never restored its state machine from its own snapshot | Without compaction, a restart replays the whole log and gets there anyway | The node comes back holding a fraction of its state, silently |
+
+The first was reported as seed 188 and reproduced exactly from that integer while
+it was being diagnosed. All three are now regression-tested and seeded into the
+mutation suite.
+
+A fourth failure — eleven seeds reporting state machine divergence — turned out
+to be the simulator's own model of a state machine, not a Raft defect. Reported
+as such rather than counted as a find.
 
 ### The checker is validated against a real violation
 
@@ -142,7 +165,7 @@ runs. Reproduce with `make bench` and `make mutation`.
 | Commit round, 5-node cluster | 3.13 µs — **320k commits/sec** |
 | Steady-state heartbeat, 3-node | 595 ns |
 | Leader election from cold start | **12.1 logical ticks** median |
-| Seeded bugs caught by the test suite | **14 / 14** |
+| Seeded bugs caught by the test suite | **18 / 18** |
 | Statement coverage of the core | 76.5% |
 | Test-to-code ratio | 0.98 : 1 |
 
@@ -161,7 +184,7 @@ both ways:
 
 ### Mutation testing
 
-`make mutation` seeds fourteen known Raft bugs — the classic ones, including Figure 8
+`make mutation` seeds eighteen known Raft bugs — the classic ones, including Figure 8
 and index-first log comparison — and checks that the test named after each one
 actually fails. It runs in 2.2 s and gates CI.
 
@@ -305,8 +328,8 @@ Built in milestones, each with an explicit exit criterion rather than a vibe.
 | done | Deterministic simulator, fault injection, safety checker, `simctl` |
 | done | bbolt storage, gRPC transport, node driver, `raftd` |
 | done | KV state machine, read-index linearizable reads, client API, `kvctl` |
-| next | Snapshotting and `InstallSnapshot` |
-| | Joint-consensus membership changes |
+| done | Snapshotting, log compaction, and `InstallSnapshot` |
+| next | Joint-consensus membership changes |
 | | Randomized testing at scale, with bugs found and documented |
 | | `tc`/`netem` chaos and linearizability checking |
 | | Kubernetes, Terraform, ArgoCD, CI correctness gate |

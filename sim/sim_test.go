@@ -238,6 +238,9 @@ func TestCheckerDetectsAChangedCommittedEntry(t *testing.T) {
 	cfg := DefaultConfig(1)
 	cfg.Faults = NoFaults()
 	cfg.Duration = 3_000
+	// This test corrupts an entry near the start of the log, so the log has to
+	// still be there. Snapshotting is what this test is not about.
+	cfg.SnapshotThreshold = 1 << 30
 
 	s, err := New(cfg)
 	if err != nil {
@@ -280,6 +283,7 @@ func TestCheckerDetectsLogMatchingViolation(t *testing.T) {
 	cfg := DefaultConfig(2)
 	cfg.Faults = NoFaults()
 	cfg.Duration = 3_000
+	cfg.SnapshotThreshold = 1 << 30 // keep the whole log; see above
 
 	s, err := New(cfg)
 	if err != nil {

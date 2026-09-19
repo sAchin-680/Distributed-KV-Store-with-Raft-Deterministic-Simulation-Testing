@@ -124,12 +124,13 @@ func cmdRun(args []string) error {
 	if err != nil {
 		return err
 	}
-	report, err := s.Run()
-	if err != nil {
-		return fmt.Errorf("seed %d failed to run: %w", *seed, err)
-	}
+	report, runErr := s.Run()
 
-	if *verbose {
+	// Print the trace even when the run failed. A run that ends in an error is
+	// precisely the one whose trace is worth reading, and an earlier version
+	// returned before printing it — which made the most useful output
+	// unavailable exactly when it was needed.
+	if *verbose && report != nil {
 		lines := report.Trace.Lines()
 		if *traceLimit > 0 && len(lines) > *traceLimit {
 			fmt.Printf("... showing the last %d of %d trace lines ...\n", *traceLimit, len(lines))
@@ -139,6 +140,16 @@ func cmdRun(args []string) error {
 			fmt.Println(line)
 		}
 		fmt.Println()
+	}
+
+	if runErr != nil {
+		if report != nil {
+			fmt.Fprintln(os.Stderr, "\nfinal cluster state:")
+			for _, line := range s.Nodes() {
+				fmt.Fprintln(os.Stderr, " ", line)
+			}
+		}
+		return fmt.Errorf("seed %d failed to run: %w", *seed, runErr)
 	}
 
 	fmt.Println(report)
@@ -274,8 +285,11 @@ func cmdFuzz(args []string) error {
 	return errors.New("safety violations found")
 }
 
+// progressInterval is how often the progress line is redrawn. Cosmetic.
+const progressInterval = 200 * time.Millisecond
+
 func progress(done *atomic.Int64, total int64, began time.Time, stop *atomic.Bool) {
-	ticker := time.NewTicker(200 * time.Millisecond)
+	ticker := time.NewTicker(progressInterval)
 	defer ticker.Stop()
 	for range ticker.C {
 		if stop.Load() {

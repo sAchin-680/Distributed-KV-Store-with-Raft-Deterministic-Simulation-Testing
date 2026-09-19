@@ -44,7 +44,18 @@ type Client struct {
 
 	// MaxAttempts bounds redirects and retries for one call.
 	MaxAttempts int
+
+	// RetryDelay paces a full sweep of the cluster that found no leader.
+	//
+	// Usually that means an election is in progress, which resolves within an
+	// election timeout — so this only needs to be short enough not to add
+	// noticeable latency, and long enough not to spin.
+	RetryDelay time.Duration
 }
+
+// defaultRetryDelay is well under a typical election timeout, so a client that
+// arrives mid-election waits for the outcome rather than hammering.
+const defaultRetryDelay = 50 * time.Millisecond
 
 // NewClient connects lazily to the given client-API endpoints.
 func NewClient(endpoints ...string) (*Client, error) {
@@ -55,6 +66,7 @@ func NewClient(endpoints ...string) (*Client, error) {
 		endpoints:   endpoints,
 		conns:       make(map[string]*grpc.ClientConn, len(endpoints)),
 		MaxAttempts: 2*len(endpoints) + 2,
+		RetryDelay:  defaultRetryDelay,
 	}, nil
 }
 
@@ -252,7 +264,7 @@ func (c *Client) call(ctx context.Context, fn func(context.Context, *grpc.Client
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(50 * time.Millisecond):
+		case <-time.After(c.RetryDelay):
 		}
 	}
 	return fmt.Errorf("kvserver: no endpoint answered after %d attempts: %w",
