@@ -73,9 +73,8 @@ type GRPC struct {
 	log *slog.Logger
 
 	server   *grpc.Server
+	handlers *server
 	listener net.Listener
-
-	inbox chan raft.Message
 
 	mu    sync.RWMutex
 	peers map[raft.NodeID]*peerConn
@@ -112,10 +111,10 @@ func NewGRPC(cfg GRPCConfig) (*GRPC, error) {
 		cfg:      cfg,
 		log:      cfg.Logger.With("component", "transport", "node", uint64(cfg.ID)),
 		listener: listener,
-		inbox:    make(chan raft.Message, cfg.InboxSize),
 		peers:    make(map[raft.NodeID]*peerConn, len(cfg.Peers)),
 		closed:   make(chan struct{}),
 	}
+	t.handlers = newServer(cfg.InboxSize, t.log)
 
 	t.server = grpc.NewServer(
 		grpc.KeepaliveParams(keepalive.ServerParameters{
@@ -129,7 +128,7 @@ func NewGRPC(cfg GRPCConfig) (*GRPC, error) {
 			PermitWithoutStream: true,
 		}),
 	)
-	raftpb.RegisterRaftServer(t.server, &server{inbox: t.inbox, log: t.log})
+	raftpb.RegisterRaftServer(t.server, t.handlers)
 
 	for _, p := range cfg.Peers {
 		if p.ID == cfg.ID {
@@ -160,7 +159,7 @@ func NewGRPC(cfg GRPCConfig) (*GRPC, error) {
 // when the port was left to the OS.
 func (t *GRPC) Addr() string { return t.listener.Addr().String() }
 
-func (t *GRPC) Recv() <-chan raft.Message { return t.inbox }
+func (t *GRPC) Recv() <-chan raft.Message { return t.handlers.inbox }
 
 func (t *GRPC) Send(m raft.Message) {
 	t.mu.RLock()
@@ -200,12 +199,13 @@ func (t *GRPC) Close() error {
 		t.mu.RUnlock()
 		t.peerWG.Wait()
 
-		// Stop, not GracefulStop — see above. This blocks until every handler
-		// has returned, which is what makes closing the inbox below safe.
+		// Stop, not GracefulStop — see above.
 		t.server.Stop()
 		t.serveWG.Wait()
 
-		close(t.inbox)
+		// Closing the inbox is serialized against the handlers writing to it;
+		// see the comment on server.
+		t.handlers.shutdown()
 	})
 	return nil
 }
@@ -214,10 +214,59 @@ func (t *GRPC) Close() error {
 // Server side
 // ---------------------------------------------------------------------------
 
+// server receives messages from peers and hands them to the inbox.
+//
+// The inbox is owned here rather than by GRPC because closing it has to be
+// serialized against the handlers writing to it. Sending on a closed channel
+// panics, and "stop the server, then close the channel" is not enough: gRPC's
+// Stop cancels in-flight RPCs but does not guarantee their handler goroutines
+// have returned, so a handler can still be inside its send.
+//
+// Tracking handlers with a WaitGroup does not fix it either — the Add runs
+// inside the handler, so Wait can observe zero in the window before a handler
+// that has already been dispatched gets to it.
+//
+// A read/write lock does fix it: every send holds the read lock, the close
+// holds the write lock, and the two cannot overlap. The race detector found the
+// earlier versions of this; nothing in normal operation did.
 type server struct {
 	raftpb.UnimplementedRaftServer
-	inbox chan<- raft.Message
-	log   *slog.Logger
+	log *slog.Logger
+
+	mu     sync.RWMutex
+	inbox  chan raft.Message
+	closed bool
+}
+
+func newServer(size int, log *slog.Logger) *server {
+	return &server{inbox: make(chan raft.Message, size), log: log}
+}
+
+// deliver hands one message to the inbox, dropping it if the inbox is full or
+// the transport is shutting down.
+func (s *server) deliver(m raft.Message) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return
+	}
+	select {
+	case s.inbox <- m:
+	default:
+		// Full inbox. Dropping is the right failure here — see InboxSize.
+		s.log.Warn("inbox full, dropping message",
+			"from", uint64(m.From), "type", m.Type.String())
+	}
+}
+
+// shutdown closes the inbox, after which deliver is a no-op.
+func (s *server) shutdown() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.closed {
+		s.closed = true
+		close(s.inbox)
+	}
 }
 
 func (s *server) Deliver(stream grpc.ClientStreamingServer[raftpb.RaftMessage, raftpb.DeliverAck]) error {
@@ -239,13 +288,7 @@ func (s *server) Deliver(stream grpc.ClientStreamingServer[raftpb.RaftMessage, r
 			continue
 		}
 
-		select {
-		case s.inbox <- m:
-		default:
-			// Full inbox. Dropping is the right failure here — see InboxSize.
-			s.log.Warn("inbox full, dropping message",
-				"from", uint64(m.From), "type", m.Type.String())
-		}
+		s.deliver(m)
 	}
 }
 
