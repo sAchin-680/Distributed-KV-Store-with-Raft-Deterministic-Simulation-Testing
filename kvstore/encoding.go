@@ -34,8 +34,10 @@ func EncodeCommand(cmd Command) ([]byte, error) {
 		return nil, fmt.Errorf("kvstore: value is %d bytes, limit is %d", len(cmd.Value), maxValueLen)
 	}
 
-	buf := make([]byte, 0, 1+binary.MaxVarintLen64*2+len(cmd.Key)+len(cmd.Value))
+	buf := make([]byte, 0, 1+binary.MaxVarintLen64*4+len(cmd.Key)+len(cmd.Value))
 	buf = append(buf, byte(cmd.Op))
+	buf = binary.AppendUvarint(buf, cmd.ClientID)
+	buf = binary.AppendUvarint(buf, cmd.Sequence)
 	buf = appendBytes(buf, cmd.Key)
 	if cmd.Op == OpSet {
 		buf = appendBytes(buf, cmd.Value)
@@ -51,6 +53,20 @@ func DecodeCommand(b []byte) (Command, error) {
 
 	cmd := Command{Op: Op(b[0])}
 	rest := b[1:]
+
+	clientID, n := binary.Uvarint(rest)
+	if n <= 0 {
+		return Command{}, fmt.Errorf("kvstore: truncated client id")
+	}
+	cmd.ClientID = clientID
+	rest = rest[n:]
+
+	seq, n := binary.Uvarint(rest)
+	if n <= 0 {
+		return Command{}, fmt.Errorf("kvstore: truncated sequence number")
+	}
+	cmd.Sequence = seq
+	rest = rest[n:]
 
 	key, rest, err := readBytes(rest, "key")
 	if err != nil {
@@ -68,7 +84,7 @@ func DecodeCommand(b []byte) (Command, error) {
 	return cmd, nil
 }
 
-// SetCommand is shorthand for the common case.
+// SetCommand is shorthand for a write with no session attached.
 func SetCommand(key, value []byte) ([]byte, error) {
 	return EncodeCommand(Command{Op: OpSet, Key: key, Value: value})
 }
@@ -76,6 +92,20 @@ func SetCommand(key, value []byte) ([]byte, error) {
 // DeleteCommand is shorthand for the other one.
 func DeleteCommand(key []byte) ([]byte, error) {
 	return EncodeCommand(Command{Op: OpDelete, Key: key})
+}
+
+// SessionSetCommand is a write a retry can be recognized by.
+func SessionSetCommand(clientID, seq uint64, key, value []byte) ([]byte, error) {
+	return EncodeCommand(Command{
+		Op: OpSet, Key: key, Value: value, ClientID: clientID, Sequence: seq,
+	})
+}
+
+// SessionDeleteCommand is the delete equivalent.
+func SessionDeleteCommand(clientID, seq uint64, key []byte) ([]byte, error) {
+	return EncodeCommand(Command{
+		Op: OpDelete, Key: key, ClientID: clientID, Sequence: seq,
+	})
 }
 
 // ---------------------------------------------------------------------------

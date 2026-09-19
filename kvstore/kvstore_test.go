@@ -9,11 +9,14 @@ import (
 	"github.com/sAchin-680/raftkv/raft"
 )
 
-func apply(t *testing.T, s *kvstore.Store, index raft.Index, cmd []byte) {
+func apply(t *testing.T, s *kvstore.Store, index raft.Index, cmd []byte) kvstore.Result {
 	t.Helper()
-	if err := s.Apply(raft.LogEntry{Index: index, Term: 1, Type: raft.EntryNormal, Command: cmd}); err != nil {
+	res, err := s.Apply(raft.LogEntry{Index: index, Term: 1, Type: raft.EntryNormal, Command: cmd})
+	if err != nil {
 		t.Fatalf("Apply(%d): %v", index, err)
 	}
+	r, _ := res.(kvstore.Result)
+	return r
 }
 
 func set(t *testing.T, key, value string) []byte {
@@ -128,7 +131,7 @@ func TestKeysAreSorted(t *testing.T) {
 // nothing to detect the divergence.
 func TestUndecodableCommandIsFatal(t *testing.T) {
 	s := kvstore.New()
-	err := s.Apply(raft.LogEntry{Index: 1, Term: 1, Command: []byte{0xff}})
+	_, err := s.Apply(raft.LogEntry{Index: 1, Term: 1, Command: []byte{0xff}})
 	if err == nil {
 		t.Error("a malformed command was accepted; a node that skips an entry " +
 			"other nodes applied has silently diverged")

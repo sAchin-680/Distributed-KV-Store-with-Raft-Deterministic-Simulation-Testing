@@ -46,6 +46,12 @@ type Command struct {
 	Op    Op
 	Key   []byte
 	Value []byte
+
+	// ClientID and Sequence identify the client and the request, so a retry of
+	// a command that already committed replays its stored answer instead of
+	// being applied a second time. A zero ClientID opts out.
+	ClientID uint64
+	Sequence uint64
 }
 
 // Store is an in-memory key/value map driven by the log.
@@ -57,6 +63,11 @@ type Store struct {
 	mu   sync.RWMutex
 	data map[string][]byte
 
+	// sessions remembers the last request applied per client, so a retry can be
+	// recognized. See session.go.
+	sessions    map[uint64]session
+	maxSessions int
+
 	// applied is the highest log index folded into this map. A read needs it to
 	// answer "is this state at least as new as the index I was promised?",
 	// which is the question a linearizable read turns into.
@@ -64,38 +75,62 @@ type Store struct {
 }
 
 // New returns an empty store.
-func New() *Store {
-	return &Store{data: make(map[string][]byte)}
+func New() *Store { return NewWithSessionLimit(DefaultMaxSessions) }
+
+// NewWithSessionLimit returns an empty store remembering at most n clients.
+func NewWithSessionLimit(n int) *Store {
+	if n < 1 {
+		n = 1
+	}
+	return &Store{
+		data:        make(map[string][]byte),
+		sessions:    make(map[uint64]session),
+		maxSessions: n,
+	}
 }
 
-var _ interface{ Apply(raft.LogEntry) error } = (*Store)(nil)
+var _ interface {
+	Apply(raft.LogEntry) (any, error)
+} = (*Store)(nil)
 
-// Apply folds one committed entry into the map.
+// Apply folds one committed entry into the map and returns what the write
+// should answer.
 //
 // Called in log order, once per entry, never concurrently.
-func (s *Store) Apply(entry raft.LogEntry) error {
+func (s *Store) Apply(entry raft.LogEntry) (any, error) {
 	cmd, err := DecodeCommand(entry.Command)
 	if err != nil {
 		// A command this build cannot parse is a fatal condition, not something
 		// to skip. Skipping it would leave this node's state machine different
 		// from every other node's, with nothing to detect the divergence.
-		return fmt.Errorf("kvstore: entry %d: %w", entry.Index, err)
+		return nil, fmt.Errorf("kvstore: entry %d: %w", entry.Index, err)
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// A retry of something already applied replays its answer. The applied
+	// index still advances — the entry is in the log either way — but the map
+	// is left alone.
+	if result, duplicate := s.checkSession(cmd.ClientID, cmd.Sequence); duplicate {
+		s.applied = entry.Index
+		return result, nil
+	}
+
+	var result Result
 	switch cmd.Op {
 	case OpSet:
 		s.data[string(cmd.Key)] = slices.Clone(cmd.Value)
 	case OpDelete:
+		_, result.Existed = s.data[string(cmd.Key)]
 		delete(s.data, string(cmd.Key))
 	default:
-		return fmt.Errorf("kvstore: entry %d has unknown operation %d", entry.Index, cmd.Op)
+		return nil, fmt.Errorf("kvstore: entry %d has unknown operation %d", entry.Index, cmd.Op)
 	}
 
+	s.recordSession(cmd.ClientID, cmd.Sequence, entry.Index, result)
 	s.applied = entry.Index
-	return nil
+	return result, nil
 }
 
 // Get reads a key, reporting whether it was present.

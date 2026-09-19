@@ -55,8 +55,14 @@ var (
 //
 // Apply must be deterministic. Two nodes applying the same entry must reach the
 // same state, or the replicated log stops meaning anything.
+//
+// The returned value is handed back to whoever proposed the command, and is
+// what lets a write answer something more than "it committed" — whether a
+// delete removed anything, or whether the command was a duplicate whose stored
+// answer was replayed. It travels no further than the proposing node: the entry
+// is replicated, the answer is not.
 type StateMachine interface {
-	Apply(entry raft.LogEntry) error
+	Apply(entry raft.LogEntry) (any, error)
 }
 
 // Config configures a node.
@@ -136,8 +142,18 @@ type proposal struct {
 }
 
 type proposeResult struct {
-	index raft.Index
-	err   error
+	index    raft.Index
+	response any
+	err      error
+}
+
+// Result is what a completed proposal reports.
+type Result struct {
+	// Index is where the command landed in the log.
+	Index raft.Index
+
+	// Response is whatever the state machine returned for it.
+	Response any
 }
 
 // awaiting is a proposal that has been appended and is waiting to be applied.
@@ -338,14 +354,17 @@ func (n *Node) applyCommitted() error {
 		}
 
 		for _, e := range entries {
+			var response any
 			// A no-op carries nothing for the application; it exists so the
 			// leader has an entry of its own term to commit.
 			if e.Type == raft.EntryNormal {
-				if err := n.cfg.StateMachine.Apply(e); err != nil {
+				var err error
+				response, err = n.cfg.StateMachine.Apply(e)
+				if err != nil {
 					return fmt.Errorf("applying index %d: %w", e.Index, err)
 				}
 			}
-			n.resolve(e)
+			n.resolve(e, response)
 		}
 		n.rn.ApplyTo(entries[len(entries)-1].Index)
 	}
@@ -353,7 +372,7 @@ func (n *Node) applyCommitted() error {
 }
 
 // resolve answers whoever proposed the entry now being applied.
-func (n *Node) resolve(e raft.LogEntry) {
+func (n *Node) resolve(e raft.LogEntry, response any) {
 	w, ok := n.pending[e.Index]
 	if !ok {
 		return
@@ -366,7 +385,7 @@ func (n *Node) resolve(e raft.LogEntry) {
 		w.p.done <- proposeResult{err: ErrProposalDropped}
 		return
 	}
-	w.p.done <- proposeResult{index: e.Index}
+	w.p.done <- proposeResult{index: e.Index, response: response}
 }
 
 func (n *Node) handlePropose(p *proposal) {
@@ -404,28 +423,31 @@ func (n *Node) fatal(during string, err error) {
 
 // Propose replicates a command and returns once it has been applied here.
 //
-// The returned index is where the command landed. An error does not always mean
-// the command was not applied — see ErrProposalDropped.
-func (n *Node) Propose(ctx context.Context, cmd []byte) (raft.Index, error) {
+// An error does not always mean the command was not applied — see
+// ErrProposalDropped.
+func (n *Node) Propose(ctx context.Context, cmd []byte) (Result, error) {
 	p := &proposal{cmd: cmd, done: make(chan proposeResult, 1)}
 
 	select {
 	case n.proposeCh <- p:
 	case <-ctx.Done():
-		return 0, ctx.Err()
+		return Result{}, ctx.Err()
 	case <-n.doneCh:
-		return 0, ErrStopped
+		return Result{}, ErrStopped
 	}
 
 	select {
 	case res := <-p.done:
-		return res.index, res.err
+		if res.err != nil {
+			return Result{}, res.err
+		}
+		return Result{Index: res.index, Response: res.response}, nil
 	case <-ctx.Done():
 		// The proposal may still commit. The caller cannot tell, which is the
 		// honest answer and the reason client sessions exist.
-		return 0, ctx.Err()
+		return Result{}, ctx.Err()
 	case <-n.doneCh:
-		return 0, ErrStopped
+		return Result{}, ErrStopped
 	}
 }
 
