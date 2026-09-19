@@ -1,0 +1,50 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - errorlint      # catches errors compared with == instead of errors.Is
+    - copyloopvar
+    - gocritic
+    - goconst
+    - misspell
+    - nilerr
+    - revive
+    - unconvert
+    - unparam
+    - usestdlibvars
+    - wastedassign
+
+  settings:
+    revive:
+      rules:
+        - name: exported
+          disabled: true   # doc comments are enforced by review, not by a linter
+    gocritic:
+      disabled-checks:
+        - ifElseChain      # the core reads better as explicit ladders in places
+
+  exclusions:
+    rules:
+      # Generated protobuf code is not ours to lint.
+      - path: "proto/.*\\.pb\\.go"
+        linters:
+          - all
+      # Tests may shadow and ignore more freely than production code.
+      - path: "_test\\.go"
+        linters:
+          - goconst
+          - unparam
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/sAchin-680/raftkv
