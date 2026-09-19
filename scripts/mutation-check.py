@@ -33,7 +33,16 @@ GREEN, RED, YELLOW, DIM, RESET = "\033[32m", "\033[31m", "\033[33m", "\033[2m", 
 @dataclass
 class Mutation:
     name: str
-    """What bug is being introduced, in the words someone would use to describe it."""
+    """Stable identifier: <area>/<what the mutated code does wrong>.
+
+    The area prefix groups the report and makes `-k election` mean something.
+    The remainder is always a third-person description of the *defect*, not of
+    the fix or the test — consistent voice, so a report reads as a list of
+    things that would be wrong rather than a mixture of states and actions.
+
+    These appear in CI logs, so treat them as stable identifiers: rename only
+    when the mutation itself changes.
+    """
 
     file: str
     old: str
@@ -48,7 +57,7 @@ class Mutation:
 
 MUTATIONS: list[Mutation] = [
     Mutation(
-        name="election-restriction-compares-index-first",
+        name="election/restriction-compares-index-before-term",
         file="raft/log.go",
         old="""	myTerm := l.lastTerm()
 	if lastTerm != myTerm {
@@ -64,7 +73,7 @@ MUTATIONS: list[Mutation] = [
         "then overwrites. Leader Completeness is gone.",
     ),
     Mutation(
-        name="follower-truncates-entries-it-already-holds",
+        name="log/truncates-entries-already-held",
         file="raft/log.go",
         old="""	case conflict == 0:""",
         new="""	case false:""",
@@ -73,7 +82,7 @@ MUTATIONS: list[Mutation] = [
         "later message already delivered.",
     ),
     Mutation(
-        name="commit-index-can-move-backwards",
+        name="log/commit-index-moves-backwards",
         file="raft/log.go",
         old="""	if i <= l.committed {
 		return
@@ -86,7 +95,7 @@ MUTATIONS: list[Mutation] = [
         "promised to a client.",
     ),
     Mutation(
-        name="node-can-vote-twice-in-one-term",
+        name="election/votes-twice-in-one-term",
         file="raft/election.go",
         old="""	case r.vote == None && r.lead == None:""",
         new="""	case true:""",
@@ -95,7 +104,7 @@ MUTATIONS: list[Mutation] = [
         "guarantee built on top.",
     ),
     Mutation(
-        name="pre-vote-ignores-whether-a-leader-is-alive",
+        name="election/pre-vote-ignores-live-leader",
         file="raft/election.go",
         old="""		return r.lead == None || r.electionElapsed >= r.randomizedElectionTimeout""",
         new="""		return true""",
@@ -104,7 +113,7 @@ MUTATIONS: list[Mutation] = [
         "deposes a healthy leader.",
     ),
     Mutation(
-        name="rejected-pre-vote-echoes-the-asked-about-term",
+        name="election/rejected-pre-vote-echoes-hypothetical-term",
         file="raft/election.go",
         old="""	if m.PreVote && granted {""",
         new="""	if m.PreVote {""",
@@ -113,7 +122,7 @@ MUTATIONS: list[Mutation] = [
         "causes exactly the disruption it exists to prevent. This was a real bug.",
     ),
     Mutation(
-        name="election-timeout-is-not-randomized",
+        name="election/timeout-not-randomized",
         file="raft/raft.go",
         old="""	r.randomizedElectionTimeout = r.cfg.ElectionTick + r.cfg.Rand.Intn(r.cfg.ElectionTick)""",
         new="""	r.randomizedElectionTimeout = r.cfg.ElectionTick""",
@@ -122,7 +131,7 @@ MUTATIONS: list[Mutation] = [
         "The cluster can fail to elect a leader indefinitely.",
     ),
     Mutation(
-        name="commit-on-quorum-alone-ignoring-the-leaders-term",
+        name="replication/commits-on-quorum-without-current-term",
         file="raft/replication.go",
         old="""	if term != r.term {
 		// Replicated to a majority, but from an earlier term. Not ours to
@@ -135,7 +144,7 @@ MUTATIONS: list[Mutation] = [
         "leader. The single most consequential mistake in a from-scratch Raft.",
     ),
     Mutation(
-        name="commit-counts-next-instead-of-match",
+        name="replication/commit-counts-next-not-match",
         file="raft/replication.go",
         old="""			return p.Match""",
         new="""			return p.Next""",
@@ -144,7 +153,7 @@ MUTATIONS: list[Mutation] = [
         "leader intends to send, not what arrived.",
     ),
     Mutation(
-        name="conflict-hint-ignored-backing-up-one-index",
+        name="replication/conflict-hint-ignored",
         file="raft/replication.go",
         old="""		if idx, found := r.lastIndexOfTerm(m.ConflictTerm); found {
 			return idx + 1
@@ -185,18 +194,25 @@ def main() -> int:
             print(f"{m.name}\n    {m.file} -> {m.expect}\n    {DIM}{m.why}{RESET}\n")
         return 0
 
+    # Mutations are listed grouped by area; keep that order in the report.
+    selected.sort(key=lambda m: m.name)
+
     # Confirm the suite is green first, or every result below is meaningless.
     if not run_tests("."):
         print(f"{RED}the test suite fails before any mutation; fix that first{RESET}")
         return 2
 
     caught, survived = 0, []
+    area = None
     for m in selected:
+        if (this_area := m.name.split("/", 1)[0]) != area:
+            area = this_area
+            print(f"{DIM}{area}{RESET}")
         path = ROOT / m.file
         original = path.read_text(encoding="utf-8")
 
         if m.old not in original:
-            print(f"{YELLOW}SKIP{RESET}  {m.name}\n      pattern no longer present in {m.file}")
+            print(f"  {YELLOW}SKIP{RESET}      {m.name}\n            pattern no longer present in {m.file}")
             survived.append(m.name + " (stale pattern)")
             continue
 
@@ -207,11 +223,11 @@ def main() -> int:
             path.write_text(original, encoding="utf-8")
 
         if passed:
-            print(f"{RED}SURVIVED{RESET}  {m.name}")
-            print(f"          {m.expect} still passes with the bug present")
+            print(f"  {RED}SURVIVED{RESET}  {m.name}")
+            print(f"            {m.expect} still passes with the bug present")
             survived.append(m.name)
         else:
-            print(f"{GREEN}caught{RESET}    {m.name}")
+            print(f"  {GREEN}caught{RESET}    {m.name}")
             caught += 1
 
     print()
