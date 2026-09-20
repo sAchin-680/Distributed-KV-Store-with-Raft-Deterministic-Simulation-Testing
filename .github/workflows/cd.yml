@@ -42,7 +42,6 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE: ${{ github.repository_owner }}/raftkv
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -95,17 +94,26 @@ jobs:
       packages: write
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
+      image: ${{ steps.meta.outputs.image }}
       digest: ${{ steps.push.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Work out the tag
+      - name: Work out the image name and tag
         id: meta
-        # The commit SHA, not a version and not "latest". A tag that can be
-        # moved makes the deployed code unknowable from the repository; a tag
-        # that is a commit makes "what is running in production" a question with
-        # an exact answer.
-        run: echo "tag=sha-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+        # The tag is the commit SHA, not a version and not "latest". A tag that
+        # can be moved makes the deployed code unknowable from the repository;
+        # a tag that is a commit makes "what is running in production" a
+        # question with an exact answer.
+        #
+        # The owner is lowercased because a Docker repository name must be, and
+        # a GitHub owner need not be: this account is "sAchin-680", which
+        # produced `invalid tag ...: repository name must be lowercase` and
+        # failed the build after the whole correctness gate had passed. There is
+        # no lowercase function in a workflow expression, so it happens here.
+        run: |
+          echo "tag=sha-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+          echo "image=${GITHUB_REPOSITORY_OWNER,,}/raftkv" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@v3
 
@@ -123,7 +131,7 @@ jobs:
           target: runtime
           push: true
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+            ${{ env.REGISTRY }}/${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
           build-args: |
             VERSION=${{ steps.meta.outputs.tag }}
             COMMIT=${{ github.sha }}

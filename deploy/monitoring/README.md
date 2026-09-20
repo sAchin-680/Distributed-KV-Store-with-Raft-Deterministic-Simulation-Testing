@@ -27,6 +27,34 @@ So `monitoring.sh demo` takes quorum away and checks the alert arrives at Alertm
 
 There is a detail in that demo worth not skipping past. Scaling the StatefulSet from five to two does *not* remove anything from the Raft configuration — membership lives in the replicated log and only changes through joint consensus. The cluster still believed it had five voters, so the two survivors could not assemble a majority and correctly refused to serve. Had the three nodes been removed properly with `kvctl members`, two would have been a legitimate cluster and nothing would have fired. The alert is measuring the right thing: a majority of the *configuration*, not a count of running pods.
 
+## Every rule is evaluated per environment
+
+One Prometheus scrapes both staging and production, and that makes the obvious expression wrong in a way that is silent.
+
+`max(raftkv_raft_has_leader) == 0` asks whether *any node anywhere* has a leader. A perfectly healthy production holds it at 1, so staging could be completely down — no leader, nothing committing — and not a single alert would fire. Grouping `by (namespace)` asks the question once per cluster, which is the only version of it that means anything.
+
+Verified by breaking staging while production ran:
+
+```
+every alert that fired, with its namespace:
+  RaftKVBelowQuorum   namespace=raftkv-staging   severity=critical
+  RaftKVNoLeader      namespace=raftkv-staging   severity=critical
+
+production pods running: 5     (never implicated)
+```
+
+The quorum threshold is derived per environment too, from each cluster's own voter count — staging needs 2 of 3, production 3 of 5 — so neither is hardcoded and both survive a membership change.
+
+## Self-heal and this demo want opposite things
+
+On a GitOps-managed cluster the alert demo cannot work as written, and the reason is worth understanding rather than working around.
+
+ArgoCD puts a hand-scaled cluster back in about a second. The below-quorum alert deliberately waits fifteen, because a leaderless instant is normal. So the drift is gone long before the alert could fire, and the alert can never be exercised while reconciliation runs.
+
+Both behaviours are correct. The alert still has to be tested, because **self-heal only repairs drift from the repository** — it does nothing about the failures the alert actually exists for. A partition, a lost node, a disk that stopped answering: the manifests still match, there is no drift, and ArgoCD has no opinion. Those are exactly the cases where the alert is the only thing that notices.
+
+So `monitoring.sh demo` pauses reconciliation for the duration and restores it afterwards, including on a ctrl-c partway through.
+
 ## Why the rules are written this way
 
 **`RaftKVNoLeader` is the one that matters**, and it is expressed as "no node can name a leader" rather than as a count of running pods, because those are different questions. Five pods can be `Running` and perfectly healthy while a partition leaves none of them able to reach a majority — every pod fine, the cluster down. Kubernetes cannot see the difference; this metric can.
@@ -34,6 +62,8 @@ There is a detail in that demo worth not skipping past. Scaling the StatefulSet 
 It waits 15 seconds, not zero. A leaderless instant is *normal* — every election has one — and an alert that fires on each routine failover trains people to ignore it. Fifteen seconds is roughly ten election timeouts, which distinguishes "failing to elect" from "in the middle of electing".
 
 **`RaftKVBelowQuorum`** reads the voter count from the cluster rather than hardcoding five, so it stays correct across membership changes.
+
+**`RaftKVLeaderFlapping` uses `max`, not `sum`, and that was a bug before it was a decision.** Every node observes the same sequence of leadership changes, so the per-node counters are N redundant views of one sequence rather than N independent events. Summing them multiplies each change by however many nodes saw it: on a five-node cluster a *single* leadership change scores 5 and trips a threshold of 4. It also makes the value depend on cluster size and on how many pods happen to be reporting, so identical behaviour alerts differently after a scale-up. This fired spuriously for exactly that reason until the aggregator was corrected.
 
 **`RaftKVNodeDown` is a warning, not a page.** One node down on a five-node cluster is survivable by construction. It becomes urgent only when a second follows, and that is what the quorum alert is for.
 
