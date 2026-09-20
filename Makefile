@@ -288,6 +288,24 @@ undeploy: ## Remove the release and its volumes
 rollout: ## Roll every pod under load and check the history is linearizable
 	RELEASE=$(RELEASE) deploy/rollout.sh run
 
+.PHONY: monitoring-up
+monitoring-up: ## Install Prometheus, Alertmanager and Grafana alongside the cluster
+	deploy/monitoring/monitoring.sh up
+
+.PHONY: monitoring-down
+monitoring-down: ## Remove the monitoring stack
+	deploy/monitoring/monitoring.sh down
+
+.PHONY: monitoring-open
+monitoring-open: ## Port-forward Grafana, Prometheus and Alertmanager
+	deploy/monitoring/monitoring.sh open
+
+# An alert rule that has never fired is an assertion, not a safeguard. This
+# takes quorum away on purpose and checks the alert actually arrives.
+.PHONY: monitoring-demo
+monitoring-demo: ## Break quorum, watch the alert fire, heal, watch it clear
+	deploy/monitoring/monitoring.sh demo
+
 ## ---------------------------------------------------------------------------
 ## Container
 ## ---------------------------------------------------------------------------

@@ -1,0 +1,277 @@
+# Prometheus, scraping the cluster's pods directly.
+#
+# Pod discovery rather than the Service, deliberately. The client Service
+# load-balances, so scraping it would return one arbitrary node per scrape and
+# the series would flip between nodes with no way to tell them apart. Consensus
+# metrics are only meaningful per node — "what does *this* node believe the term
+# is" — so every pod is scraped individually and keeps its own identity.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus
+rules:
+  - apiGroups: [""]
+    resources: [nodes, services, endpoints, pods]
+    verbs: [get, list, watch]
+  - nonResourceURLs: ["/metrics"]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prometheus
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: monitoring
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: monitoring
+data:
+  prometheus.yml: |
+    global:
+      # Failover takes 1-2s, so a 60s scrape would miss most elections
+      # entirely and the leader-change counter would be the only evidence any
+      # happened. 5s is short enough to see the gap itself.
+      scrape_interval: 5s
+      evaluation_interval: 5s
+
+    alerting:
+      alertmanagers:
+        - static_configs:
+            - targets: [alertmanager:9093]
+
+    rule_files:
+      - /etc/prometheus/rules/*.yml
+
+    scrape_configs:
+      - job_name: raftkv
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          # Only this application's pods, and only their metrics port. Without
+          # the port filter every pod is scraped once per declared port, so the
+          # peer and client ports would appear as targets that never answer.
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+            action: keep
+            regex: raftkv
+          - source_labels: [__meta_kubernetes_pod_container_port_name]
+            action: keep
+            regex: metrics
+          # The pod name is the stable identity here: kv-raftkv-3 is always Raft
+          # node 4. Keeping it as a label means a dashboard survives the pod
+          # being replaced, which is exactly what a rolling upgrade does.
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+
+      - job_name: prometheus
+        static_configs:
+          - targets: [localhost:9090]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-rules
+  namespace: monitoring
+data:
+  raftkv.yml: |
+    groups:
+      - name: raftkv-availability
+        rules:
+          # The alert that matters. Everything else is a symptom; this is the
+          # cluster not being able to commit anything at all.
+          #
+          # Expressed as "no node can name a leader" rather than as a count of
+          # running pods, because those are different questions. Five pods can
+          # be Running and healthy while a partition leaves none of them able to
+          # reach a majority — the pods are fine and the cluster is down.
+          #
+          # 15s, not 0s: a leaderless instant is normal. Every election has one,
+          # and an alert that fires on each routine failover trains people to
+          # ignore it. 15s is roughly ten election timeouts, so it means the
+          # cluster is failing to elect rather than in the middle of electing.
+          - alert: RaftKVNoLeader
+            expr: max(raftkv_raft_has_leader) == 0
+            for: 15s
+            labels:
+              severity: critical
+            annotations:
+              summary: "The cluster has no leader and cannot commit"
+              description: >-
+                No node has named a leader for 15s, which is about ten election
+                timeouts. Writes and linearizable reads are both refused. Check
+                whether a majority can reach each other before restarting
+                anything — restarting a node that is merely leaderless removes a
+                voter the cluster needs in order to elect anyone.
+
+          # Reachable nodes have fallen below a majority of the *configuration*,
+          # which is the number that decides quorum. The voter count is read
+          # from the cluster rather than hardcoded, so it stays correct across
+          # membership changes.
+          - alert: RaftKVBelowQuorum
+            expr: count(raftkv_up == 1) < (floor(max(raftkv_cluster_voters) / 2) + 1)
+            for: 15s
+            labels:
+              severity: critical
+            annotations:
+              summary: "Fewer nodes are up than quorum requires"
+              description: >-
+                {{ $value }} nodes are reachable; a majority of the current
+                configuration is required to commit. The cluster is unavailable
+                for writes until enough nodes return. Data is not lost: no entry
+                was ever committed without a majority acknowledging it.
+
+          - alert: RaftKVNodeDown
+            expr: up{job="raftkv"} == 0
+            for: 1m
+            labels:
+              severity: warning
+            annotations:
+              summary: "{{ $labels.pod }} is not answering scrapes"
+              description: >-
+                One node being down is survivable on a five-node cluster and is
+                a warning rather than a page. It becomes urgent only if a second
+                follows, which RaftKVBelowQuorum covers.
+
+      - name: raftkv-stability
+        rules:
+          # Leadership moving is normal. Leadership moving repeatedly is a
+          # symptom, usually of a node too slow to answer heartbeats in time or
+          # a network dropping them, and each change costs a no-op commit and
+          # every in-flight request on the old leader.
+          - alert: RaftKVLeaderFlapping
+            expr: sum(increase(raftkv_raft_leader_changes_total[10m])) > 4
+            for: 0s
+            labels:
+              severity: warning
+            annotations:
+              summary: "Leadership has changed {{ $value }} times in ten minutes"
+              description: >-
+                Expected during a rolling upgrade, when every node is replaced
+                in turn. Outside one, look for a node that cannot answer
+                heartbeats within the election timeout.
+
+          # A follower falling behind does not stop the cluster, but it stops
+          # counting toward quorum in practice: the leader cannot commit without
+          # a majority acknowledging, so a lagging follower on a five-node
+          # cluster removes the margin for a second failure.
+          - alert: RaftKVFollowerLagging
+            expr: max(raftkv_raft_replication_lag) > 10000
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "A follower is {{ $value }} entries behind the leader"
+              description: >-
+                Sustained lag usually means the follower's disk cannot keep up
+                with the write rate, since every append is fsynced before it is
+                acknowledged. If it falls behind the leader's log floor it will
+                need a full snapshot to catch up.
+
+          # The state machine trailing the commit index means entries are
+          # agreed but not yet visible to readers. Brief gaps are normal; a
+          # sustained one means applying is the bottleneck.
+          - alert: RaftKVApplyLagging
+            expr: max(raftkv_raft_commit_index - raftkv_raft_applied_index) > 10000
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "The state machine is {{ $value }} entries behind the commit index"
+
+          # A membership change passes through a joint configuration that
+          # requires majorities of both the old and new voter sets. That state
+          # is meant to last milliseconds. Stuck there, the cluster needs two
+          # overlapping majorities for every commit, so it is strictly more
+          # fragile than either configuration alone.
+          - alert: RaftKVStuckInJointConfiguration
+            expr: max(raftkv_cluster_joint_configuration) == 1
+            for: 2m
+            labels:
+              severity: warning
+            annotations:
+              summary: "A membership change has not completed"
+              description: >-
+                The cluster is requiring majorities of both the old and new
+                voter sets, which is more fragile than either alone. The change
+                completes when the joint entry commits; if it cannot, the node
+                being added is probably unreachable.
+
+          # The exporter could not read the node's state. The node may be
+          # perfectly healthy, so this alerts on the monitoring rather than on
+          # the cluster — distinguishing the two matters, because treating a
+          # broken exporter as a broken cluster is how a healthy node gets
+          # restarted during an incident.
+          - alert: RaftKVScrapeFailing
+            expr: increase(raftkv_scrape_failures_total[5m]) > 5
+            for: 0s
+            labels:
+              severity: warning
+            annotations:
+              summary: "Cannot read node state on {{ $labels.pod }}"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: prometheus}
+  template:
+    metadata:
+      labels: {app: prometheus}
+    spec:
+      serviceAccountName: prometheus
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v2.54.1
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            # Long enough to look back over an incident, short enough that a
+            # local cluster does not fill its disk.
+            - --storage.tsdb.retention.time=6h
+            - --web.enable-lifecycle
+          ports:
+            - {name: web, containerPort: 9090}
+          volumeMounts:
+            - {name: config, mountPath: /etc/prometheus/prometheus.yml, subPath: prometheus.yml}
+            - {name: rules, mountPath: /etc/prometheus/rules}
+            - {name: data, mountPath: /prometheus}
+          readinessProbe:
+            httpGet: {path: /-/ready, port: web}
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {memory: 1Gi}
+      volumes:
+        - {name: config, configMap: {name: prometheus-config}}
+        - {name: rules, configMap: {name: prometheus-rules}}
+        - {name: data, emptyDir: {}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: monitoring
+spec:
+  selector: {app: prometheus}
+  ports:
+    - {name: web, port: 9090, targetPort: web}
