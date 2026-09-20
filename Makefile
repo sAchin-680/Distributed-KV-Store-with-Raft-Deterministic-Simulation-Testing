@@ -306,6 +306,27 @@ monitoring-open: ## Port-forward Grafana, Prometheus and Alertmanager
 monitoring-demo: ## Break quorum, watch the alert fire, heal, watch it clear
 	deploy/monitoring/monitoring.sh demo
 
+.PHONY: argocd-up
+argocd-up: ## Install ArgoCD and point it at the chart in this repository
+	deploy/argocd/argocd.sh up
+
+.PHONY: argocd-down
+argocd-down: ## Remove ArgoCD and the Application
+	deploy/argocd/argocd.sh down
+
+.PHONY: argocd-status
+argocd-status: ## Show what ArgoCD thinks the cluster should be
+	deploy/argocd/argocd.sh status
+
+.PHONY: argocd-open
+argocd-open: ## Port-forward the ArgoCD UI and print the admin password
+	deploy/argocd/argocd.sh open
+
+# Self-heal is a checkbox until something has drifted and been put back.
+.PHONY: argocd-demo
+argocd-demo: ## Break the cluster by hand and watch ArgoCD correct it
+	deploy/argocd/argocd.sh demo
+
 ## ---------------------------------------------------------------------------
 ## Container
 ## ---------------------------------------------------------------------------

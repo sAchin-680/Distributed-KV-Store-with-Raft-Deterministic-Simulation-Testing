@@ -290,6 +290,43 @@ believed it had five voters, so two survivors correctly refused to serve. The
 alert measures a majority of the *configuration*, not a count of pods.
 [deploy/monitoring/](deploy/monitoring/) has the rest.
 
+### Drift is corrected in two seconds
+
+ArgoCD follows the chart on `main`; nothing is applied by hand.
+
+```bash
+make argocd-up      # install, hand the release over, create the Application
+make argocd-demo    # break the cluster by hand, watch it corrected
+make argocd-open    # the UI, with the admin password
+```
+
+The demo does the realistic damage — scaling the cluster below quorum, which
+looks reasonable during an incident and quietly leaves it unable to commit:
+
+```
+the chart says 5 nodes; quorum is 3
+scaling to 2 by hand — below quorum, exactly the mistake that hurts
+detected as OutOfSync after 0s
+replica count back to 5 after 2s          final state: Synced / Healthy
+
+deleting the PodDisruptionBudget by hand
+PodDisruptionBudget restored after 2s
+```
+
+**No alert fired, and that is the result.** `RaftKVBelowQuorum` was armed
+throughout; it waits 15s because a leaderless instant is normal, and the drift
+was gone in 2. Nobody should be paged for something that repaired itself faster
+than it takes to decide whether it is real. The two thresholds were chosen
+independently and compose correctly.
+
+The release was installed by Helm before this, so ownership was handed over
+rather than shared — two controllers reconciling the same resources disagree
+eventually. That deletes the StatefulSet and every pod, and the data survived
+anyway, because a StatefulSet's PVCs are deliberately not deleted with it.
+Commit index before and after the handover: **344,703**. The cluster never
+noticed the thing managing it had changed.
+[deploy/argocd/](deploy/argocd/) has the rest.
+
 ## Measured
 
 Core-only numbers — no disk, no network, no goroutines. They say how much
@@ -484,7 +521,8 @@ Built in milestones, each with an explicit exit criterion rather than a vibe.
 | done | Prometheus metrics, health endpoints, Helm chart, Kubernetes deployment |
 | done | Rolling upgrade under load, measured against a live cluster |
 | done | Prometheus rules, Alertmanager, Grafana dashboard, alerts fired on purpose |
-| next | Terraform, ArgoCD, and the continuous-deployment correctness gate |
+| done | GitOps with ArgoCD, drift broken on purpose and corrected in two seconds |
+| next | Continuous deployment gated on the fuzz suite, and Terraform |
 
 ## Documentation
 
@@ -496,6 +534,7 @@ Built in milestones, each with an explicit exit criterion rather than a vibe.
 - [Chaos runs](docs/chaos-runs/) — histories recorded under real network faults, including the run that stayed undecided
 - [Rolling upgrade](docs/rollout/) — replacing every node under load, and the sixteen operations it cost
 - [Monitoring](deploy/monitoring/) — what to alert on in a consensus cluster, and why pod health is the wrong signal
+- [GitOps](deploy/argocd/) — drift broken on purpose, and why no alert firing was the correct outcome
 
 ## References
 
