@@ -120,20 +120,21 @@ type Report struct {
 	Seed      int64
 	Violation *Violation
 
-	Events       int
-	TraceHash    uint64
-	VirtualTime  int64
-	Elapsed      time.Duration
-	Committed    int
-	LeaderTerms  int
-	Crashes      int
-	Restarts     int
-	Partitions   int
-	Snapshots    int
-	SnapshotSent int
-	MessagesSent int
-	Dropped      int
-	Duplicated   int
+	Events            int
+	TraceHash         uint64
+	VirtualTime       int64
+	Elapsed           time.Duration
+	Committed         int
+	LeaderTerms       int
+	Crashes           int
+	Restarts          int
+	Partitions        int
+	Snapshots         int
+	SnapshotSent      int
+	MembershipChanges int
+	MessagesSent      int
+	Dropped           int
+	Duplicated        int
 
 	Trace *Trace
 }
@@ -149,10 +150,11 @@ func (r *Report) String() string {
 	return fmt.Sprintf(
 		"seed %d: %s — %d events in %s (%dms virtual), %d entries committed across "+
 			"%d leader terms, %d crashes, %d restarts, %d partitions, "+
-			"%d snapshots taken, %d sent, %d msgs (%d dropped, %d duplicated), trace %016x",
+			"%d snapshots taken, %d sent, %d membership changes, "+
+			"%d msgs (%d dropped, %d duplicated), trace %016x",
 		r.Seed, status, r.Events, r.Elapsed.Round(time.Microsecond), r.VirtualTime,
 		r.Committed, r.LeaderTerms, r.Crashes, r.Restarts, r.Partitions,
-		r.Snapshots, r.SnapshotSent,
+		r.Snapshots, r.SnapshotSent, r.MembershipChanges,
 		r.MessagesSent, r.Dropped, r.Duplicated, r.TraceHash)
 }
 
@@ -177,6 +179,7 @@ type Simulator struct {
 	stats    struct {
 		sent, dropped, duplicated, partitions int
 		snapshots, snapshotsSent              int
+		membershipChanges                     int
 	}
 }
 
@@ -292,23 +295,24 @@ func (s *Simulator) report(started time.Time, v *Violation) *Report {
 		restarts += s.nodes[id].restarts
 	}
 	return &Report{
-		Seed:         s.cfg.Seed,
-		Violation:    v,
-		Events:       s.trace.Events(),
-		TraceHash:    s.trace.Hash(),
-		VirtualTime:  s.now,
-		Elapsed:      time.Since(started),
-		Committed:    s.checker.CommittedCount(),
-		LeaderTerms:  s.checker.LeaderTerms(),
-		Crashes:      crashes,
-		Restarts:     restarts,
-		Partitions:   s.stats.partitions,
-		Snapshots:    s.stats.snapshots,
-		SnapshotSent: s.stats.snapshotsSent,
-		MessagesSent: s.stats.sent,
-		Dropped:      s.stats.dropped,
-		Duplicated:   s.stats.duplicated,
-		Trace:        s.trace,
+		Seed:              s.cfg.Seed,
+		Violation:         v,
+		Events:            s.trace.Events(),
+		TraceHash:         s.trace.Hash(),
+		VirtualTime:       s.now,
+		Elapsed:           time.Since(started),
+		Committed:         s.checker.CommittedCount(),
+		LeaderTerms:       s.checker.LeaderTerms(),
+		Crashes:           crashes,
+		Restarts:          restarts,
+		Partitions:        s.stats.partitions,
+		Snapshots:         s.stats.snapshots,
+		SnapshotSent:      s.stats.snapshotsSent,
+		MembershipChanges: s.stats.membershipChanges,
+		MessagesSent:      s.stats.sent,
+		Dropped:           s.stats.dropped,
+		Duplicated:        s.stats.duplicated,
+		Trace:             s.trace,
 	}
 }
 
@@ -474,9 +478,87 @@ func (s *Simulator) applyFaultDecision() error {
 	if s.part == nil && s.rng.Float64() < s.cfg.Faults.PartitionRate {
 		s.startPartition()
 	}
+	if s.rng.Float64() < s.cfg.Faults.MembershipRate {
+		if err := s.changeMembership(); err != nil {
+			return err
+		}
+	}
 	if s.rng.Float64() < s.cfg.Faults.CrashRate {
 		victim := s.ids[s.rng.Intn(len(s.ids))]
 		return s.applyCrash(&event{node: victim})
+	}
+	return nil
+}
+
+// changeMembership asks the leader to add or remove a voter.
+//
+// The membership moves within the fixed set of simulated nodes rather than
+// inventing new ones: what is being tested is whether the transition is safe,
+// not whether a process can be started. A node outside the configuration keeps
+// running and keeps being delivered messages, which is realistic — a removed
+// node does not vanish, it simply stops being counted.
+func (s *Simulator) changeMembership() error {
+	leader := s.leader()
+	if leader == nil {
+		return nil
+	}
+
+	current := leader.rn.Configuration()
+	if current.IsJoint() {
+		return nil // one at a time
+	}
+
+	voters := slices.Clone(current.Voters)
+	quorum := len(s.ids)/2 + 1
+
+	// Never propose a configuration that cannot tolerate a single failure. A
+	// cluster too small to lose a node makes every crash a stall, and a run
+	// spent stalled tests nothing.
+	shrink := len(voters) > quorum && s.rng.Intn(2) == 0
+	if shrink {
+		victim := voters[s.rng.Intn(len(voters))]
+		voters = slices.DeleteFunc(voters, func(id raft.NodeID) bool { return id == victim })
+	} else {
+		var absent []raft.NodeID
+		for _, id := range s.ids {
+			if !slices.Contains(voters, id) {
+				absent = append(absent, id)
+			}
+		}
+		if len(absent) == 0 {
+			return nil
+		}
+		voters = append(voters, absent[s.rng.Intn(len(absent))])
+	}
+
+	target := raft.NewConfiguration(voters)
+	if err := target.Validate(); err != nil {
+		// Not a failure of the system under test — the simulator built a
+		// configuration it should not have offered. Skip it.
+		s.trace.record(s.now, "membership skipped (%v)", err)
+		return nil
+	}
+	if _, err := leader.rn.ProposeConfChange(target); err != nil {
+		// Refusing is a legitimate answer: leadership may have moved between
+		// picking this node and asking it, or a change may already be under
+		// way. Either is the cluster behaving correctly, not an error to
+		// surface.
+		s.trace.record(s.now, "membership refused (%v)", err)
+		return nil
+	}
+
+	s.stats.membershipChanges++
+	s.trace.record(s.now, "membership %s -> %s by %d", current, target, leader.id)
+	return s.after(leader)
+}
+
+// leader returns the node that believes it leads, in sorted order, or nil.
+func (s *Simulator) leader() *node {
+	for _, id := range s.ids {
+		n := s.nodes[id]
+		if !n.crashed() && n.rn.State() == raft.Leader {
+			return n
+		}
 	}
 	return nil
 }

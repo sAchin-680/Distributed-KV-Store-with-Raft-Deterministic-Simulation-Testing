@@ -49,6 +49,10 @@ type Config struct {
 	// ReadTimeout bounds a linearizable read's leadership confirmation.
 	ReadTimeout time.Duration
 
+	// MembershipTimeout bounds a whole joint-consensus transition, which is two
+	// commits and therefore inherently slower than a single write.
+	MembershipTimeout time.Duration
+
 	Logger *slog.Logger
 }
 
@@ -60,16 +64,27 @@ func (c *Config) withDefaults() error {
 		return errors.New("kvserver: Store is required")
 	}
 	if c.WriteTimeout == 0 {
-		c.WriteTimeout = 5 * time.Second
+		c.WriteTimeout = defaultWriteTimeout
 	}
 	if c.ReadTimeout == 0 {
-		c.ReadTimeout = 5 * time.Second
+		c.ReadTimeout = defaultReadTimeout
+	}
+	if c.MembershipTimeout == 0 {
+		c.MembershipTimeout = defaultMembershipTimeout
 	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()
 	}
 	return nil
 }
+
+// Defaults. A membership change is two commits rather than one, so it is given
+// longer than an ordinary write.
+const (
+	defaultWriteTimeout      = 5 * time.Second
+	defaultReadTimeout       = 5 * time.Second
+	defaultMembershipTimeout = 30 * time.Second
+)
 
 // Server implements the KV and Cluster services.
 type Server struct {
@@ -346,9 +361,40 @@ func (s *Server) Status(ctx context.Context, _ *kvpb.StatusRequest) (*kvpb.Statu
 	return resp, nil
 }
 
-func (s *Server) ChangeMembership(context.Context, *kvpb.ChangeMembershipRequest) (*kvpb.ChangeMembershipResponse, error) {
-	return nil, status.Error(codes.Unimplemented,
-		"membership changes are not implemented yet")
+// ChangeMembership drives a joint-consensus transition to completion.
+//
+// It returns once the cluster has left the joint configuration, not once the
+// change was accepted — a caller told "done" while the cluster still needs
+// majorities of two configurations would be told something untrue about its
+// availability.
+func (s *Server) ChangeMembership(ctx context.Context, req *kvpb.ChangeMembershipRequest) (*kvpb.ChangeMembershipResponse, error) {
+	voters := make([]raft.NodeID, 0, len(req.GetVoters()))
+	for _, id := range req.GetVoters() {
+		if id == 0 {
+			return nil, status.Error(codes.InvalidArgument,
+				"node id 0 is reserved to mean 'no node'")
+		}
+		voters = append(voters, raft.NodeID(id))
+	}
+	if len(voters) == 0 {
+		return nil, status.Error(codes.InvalidArgument,
+			"a configuration with no voters cannot commit anything, including "+
+				"the change that would fix it")
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, s.cfg.MembershipTimeout)
+	defer cancel()
+
+	final, err := s.cfg.Node.ChangeMembership(ctx, voters)
+	if err != nil {
+		return nil, s.writeError(ctx, err)
+	}
+
+	st, _ := s.cfg.Node.Status(ctx)
+	return &kvpb.ChangeMembershipResponse{
+		Config: codec.ConfigurationToProto(final),
+		Index:  uint64(st.CommitIndex),
+	}, nil
 }
 
 // notLeader builds an error carrying where the leader can be reached, so a

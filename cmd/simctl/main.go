@@ -86,6 +86,8 @@ func simFlags(fs *flag.FlagSet) *sim.Config {
 	fs.Float64Var(&f.ReorderRate, "reorder", f.ReorderRate, "probability a message is delayed far behind later ones")
 	fs.Float64Var(&f.PartitionRate, "partition", f.PartitionRate, "probability of a network split per fault interval")
 	fs.Float64Var(&f.CrashRate, "crash", f.CrashRate, "probability of crashing a node per fault interval")
+	fs.Float64Var(&f.MembershipRate, "membership", f.MembershipRate,
+		"probability of starting a membership change per fault interval")
 	fs.Float64Var(&f.DiskLossRate, "disk-loss", f.DiskLossRate,
 		"probability a restarting node loses its persisted state\n"+
 			"\t(Raft's safety argument assumes it does not; expect real violations)")

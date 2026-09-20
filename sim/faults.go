@@ -66,6 +66,15 @@ type Faults struct {
 	// that failure mode knowingly, not to run by default.
 	DiskLossRate float64
 
+	// MembershipRate is the chance, at each fault decision point, of starting a
+	// membership change.
+	//
+	// A fault in the same sense as the others: reconfiguration is the operation
+	// most likely to interact badly with partitions and crashes, and the one
+	// most implementations get wrong. Running it constantly, under everything
+	// else, is the only way to find out whether it holds.
+	MembershipRate float64
+
 	// FaultInterval is how often, in virtual milliseconds, the simulator
 	// considers introducing a new fault.
 	FaultInterval int64
@@ -76,20 +85,21 @@ type Faults struct {
 // crashes. Tuned so that a 30-second run reliably exercises leader changes.
 func DefaultFaults() Faults {
 	return Faults{
-		DropRate:      0.02,
-		DuplicateRate: 0.02,
-		MinLatency:    1,
-		MaxLatency:    30,
-		ReorderRate:   0.02,
-		ReorderMax:    200,
-		PartitionRate: 0.15,
-		PartitionMin:  200,
-		PartitionMax:  2000,
-		CrashRate:     0.15,
-		RestartMin:    100,
-		RestartMax:    3000,
-		DiskLossRate:  0,
-		FaultInterval: 250,
+		DropRate:       0.02,
+		DuplicateRate:  0.02,
+		MinLatency:     1,
+		MaxLatency:     30,
+		ReorderRate:    0.02,
+		ReorderMax:     200,
+		PartitionRate:  0.15,
+		PartitionMin:   200,
+		PartitionMax:   2000,
+		CrashRate:      0.15,
+		RestartMin:     100,
+		RestartMax:     3000,
+		DiskLossRate:   0,
+		MembershipRate: 0.05,
+		FaultInterval:  250,
 	}
 }
 

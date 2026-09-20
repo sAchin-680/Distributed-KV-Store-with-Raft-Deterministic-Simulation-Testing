@@ -213,7 +213,7 @@ func (r *RawNode) handleSnapshotRequest(m Message) error {
 	// Adopt the configuration the snapshot carries. The entries that would have
 	// told us the membership are exactly what the snapshot replaced.
 	if !snap.Config.IsEmpty() {
-		r.conf = snap.Config.Clone()
+		r.setConfiguration(snap.Config, snap.LastIncludedIndex)
 	}
 
 	// Hand it to the driver, which is the only thing that can rebuild the

@@ -80,11 +80,30 @@ func newCluster(t *testing.T, size int) *cluster {
 // reach the snapshot-transfer path in under a second.
 func newClusterWithSnapshots(t *testing.T, size int, threshold, catchUp uint64) *cluster {
 	t.Helper()
+	return newClusterFull(t, size, size, threshold, catchUp)
+}
+
+// newClusterOfSize starts size processes but only counts the first voters of
+// them as members, so the rest can be added later. A node being added is
+// already running and reachable — joining is a change to who is *counted*, not
+// a change to who exists.
+func newClusterOfSize(t *testing.T, size, voters int) *cluster {
+	t.Helper()
+	return newClusterFull(t, size, voters, 0, 0)
+}
+
+func newClusterFull(t *testing.T, size, voters int, threshold, catchUp uint64) *cluster {
+	t.Helper()
 
 	addrs := reservePorts(t, size)
 	peers := make([]transport.Peer, size)
 	for i := range peers {
 		peers[i] = transport.Peer{ID: raft.NodeID(i + 1), Address: addrs[i]}
+	}
+	// Everyone can reach everyone; only the first `voters` are members.
+	bootstrap := make([]raft.NodeID, voters)
+	for i := range bootstrap {
+		bootstrap[i] = raft.NodeID(i + 1)
 	}
 
 	dir := t.TempDir()
@@ -127,6 +146,7 @@ func newClusterWithSnapshots(t *testing.T, size int, threshold, catchUp uint64) 
 		sm := kvstore.New()
 		n, err := node.Start(node.Config{
 			ID: p.ID, Peers: peers, Storage: db, Transport: tr, StateMachine: sm,
+			Bootstrap: bootstrap,
 			// 30ms ticks give a 300–600ms election timeout: slow enough that a
 			// loaded CI machine does not trigger spurious elections, fast enough
 			// that the test finishes.
@@ -798,5 +818,130 @@ func TestNodeRestoresFromItsOwnSnapshot(t *testing.T) {
 		if _, ok := c.kv[leader].Get(fmt.Appendf(nil, "k-%d", i)); !ok {
 			t.Fatalf("k-%d was lost across a snapshot restart", i)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Membership changes
+// ---------------------------------------------------------------------------
+
+// Grow a live cluster from three voters to four, over a real network, while it
+// is serving writes.
+func TestClusterGrowsWhileServingWrites(t *testing.T) {
+	// Four processes, three of them voters. The fourth is running and reachable
+	// but not counted — which is what joining actually looks like.
+	c := newClusterOfSize(t, 4, 3)
+	leader, _ := c.awaitLeader(20 * time.Second)
+
+	for i := range 5 {
+		if err := c.set(leader, fmt.Sprintf("before-%d", i), "x"); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	final, err := c.nodes[leader].ChangeMembership(ctx, raft.NewConfiguration(c.ids).Voters)
+	if err != nil {
+		t.Fatalf("ChangeMembership: %v\n%s", err, c.dump())
+	}
+	if final.IsJoint() {
+		t.Fatalf("returned while still joint: %s — a joint cluster needs two "+
+			"majorities for everything and is less available than either", final)
+	}
+	if len(final.Voters) != 4 {
+		t.Fatalf("final configuration = %s, want four voters", final)
+	}
+
+	// The new member must receive everything, old and new.
+	if err := c.set(leader, "after", "y"); err != nil {
+		t.Fatalf("write after the change: %v", err)
+	}
+	newcomer := c.ids[len(c.ids)-1]
+	deadline := time.After(20 * time.Second)
+	for c.kv[newcomer].Len() < 6 {
+		select {
+		case <-deadline:
+			t.Fatalf("the new voter holds %d of 6 keys\n%s", c.kv[newcomer].Len(), c.dump())
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
+// Shrinking must reach a configuration that can still make progress.
+func TestClusterShrinks(t *testing.T) {
+	c := newClusterOfSize(t, 5, 5)
+	leader, _ := c.awaitLeader(20 * time.Second)
+
+	if err := c.set(leader, "before", "x"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// Drop a node that is not the leader, so the test is about membership
+	// rather than about leadership transfer.
+	var keep []raft.NodeID
+	var dropped raft.NodeID
+	for _, id := range c.ids {
+		if id != leader && dropped == 0 {
+			dropped = id
+			continue
+		}
+		keep = append(keep, id)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	final, err := c.nodes[leader].ChangeMembership(ctx, keep)
+	if err != nil {
+		t.Fatalf("ChangeMembership: %v\n%s", err, c.dump())
+	}
+	if len(final.Voters) != 4 || final.IsVoter(dropped) {
+		t.Fatalf("final configuration = %s, want node %d removed", final, dropped)
+	}
+
+	// The smaller cluster must still commit.
+	if err := c.set(leader, "after", "y"); err != nil {
+		t.Fatalf("write after shrinking: %v", err)
+	}
+}
+
+// Only one change may be in flight. A second would reintroduce exactly the
+// ambiguity joint consensus removes.
+func TestSecondMembershipChangeIsRefusedWhileOneIsInFlight(t *testing.T) {
+	c := newClusterOfSize(t, 4, 3)
+	leader, _ := c.awaitLeader(20 * time.Second)
+
+	// Cut the leader off so the first change cannot commit and stays joint.
+	for _, id := range c.ids {
+		if id != leader {
+			c.shutdown(id)
+		}
+	}
+
+	first, cancelFirst := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelFirst()
+	_, _ = c.nodes[leader].ChangeMembership(first, raft.NewConfiguration(c.ids).Voters)
+
+	second, cancelSecond := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelSecond()
+	_, err := c.nodes[leader].ChangeMembership(second, c.ids[:2])
+	if err == nil {
+		t.Error("a second membership change was accepted while the first was " +
+			"still in flight")
+	}
+}
+
+func TestEmptyMembershipIsRefused(t *testing.T) {
+	c := newCluster(t, 3)
+	leader, _ := c.awaitLeader(15 * time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if _, err := c.nodes[leader].ChangeMembership(ctx, nil); err == nil {
+		t.Error("an empty configuration was accepted; such a cluster cannot " +
+			"commit anything, including the change that would fix it")
 	}
 }
