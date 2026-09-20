@@ -1,0 +1,274 @@
+# Continuous deployment.
+#
+# The gate is the point. Everything here is downstream of the same correctness
+# checks a pull request runs — including a fuzz campaign over the deterministic
+# simulator — so a commit that breaks consensus under simulated faults never
+# produces an image, let alone reaches a cluster.
+#
+# That ordering is deliberate rather than conventional. A consensus bug does not
+# announce itself: it is a stale read served once under a partition that healed,
+# or a committed entry lost in an election nobody noticed. Finding it in staging
+# requires the same unlucky interleaving that hid it in testing, so "deploy to
+# staging and watch" is not a safety net here in the way it is for a web service.
+# The simulator searches those interleavings deliberately, and it is the only
+# thing in this pipeline that can.
+#
+# Deployment itself is a commit. Nothing here runs kubectl or helm against a
+# cluster: it writes an image tag into a values file, and ArgoCD does the rest.
+# That keeps the deployed version knowable from the repository and revertible by
+# reverting a commit.
+
+name: CD
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      promote:
+        description: Promote the current staging image to production
+        type: boolean
+        default: false
+
+concurrency:
+  # One deployment at a time, and never cancel one in flight. A cancelled run
+  # that has pushed an image but not yet written the tag leaves the repository
+  # describing a version that is not deployed.
+  group: cd-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ${{ github.repository_owner }}/raftkv
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # The gate
+  # ---------------------------------------------------------------------------
+
+  verify:
+    name: Correctness gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Static analysis and determinism guards
+        run: |
+          make vet
+          make determinism
+
+      - name: Unit tests
+        run: go test ./... -race -count=1 -timeout=15m
+
+      # A test suite that cannot fail is indistinguishable from one that passes.
+      # Each mutation is a plausible mistake with a named test that must catch
+      # it; a survivor means that test is decorative.
+      - name: Mutation gate
+        run: make mutation
+
+      # The campaign the rest of this pipeline is gated on. Every seed is a
+      # distinct schedule of message delivery, loss, reordering and partition,
+      # and any failing one fails the build and is replayable from its integer.
+      - name: Simulation fuzz gate
+        run: make fuzz FUZZ_SEEDS=2000
+
+  # ---------------------------------------------------------------------------
+  # Build
+  # ---------------------------------------------------------------------------
+
+  build:
+    name: Build and push
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Work out the tag
+        id: meta
+        # The commit SHA, not a version and not "latest". A tag that can be
+        # moved makes the deployed code unknowable from the repository; a tag
+        # that is a commit makes "what is running in production" a question with
+        # an exact answer.
+        run: echo "tag=sha-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.tag }}
+            COMMIT=${{ github.sha }}
+          # The cache is scoped to the branch so a pull request cannot poison
+          # what main builds from.
+          cache-from: type=gha,scope=${{ github.ref_name }}
+          cache-to: type=gha,mode=max,scope=${{ github.ref_name }}
+          provenance: true
+          sbom: true
+
+  # ---------------------------------------------------------------------------
+  # Staging — automatic
+  # ---------------------------------------------------------------------------
+
+  staging:
+    name: Deploy to staging
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: staging
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Deployment is a commit. ArgoCD is watching this file and will sync
+      # within its poll interval; nothing here talks to a cluster.
+      - name: Point staging at the new image
+        run: |
+          set -euo pipefail
+          file=deploy/helm/raftkv/values-staging.yaml
+          tag='${{ needs.build.outputs.tag }}'
+
+          # Anchored to the tag line inside the image block rather than any
+          # line containing "tag:", so an unrelated key is never rewritten.
+          python3 - "$file" "$tag" <<'PY'
+          import re, sys
+          path, tag = sys.argv[1], sys.argv[2]
+          text = open(path).read()
+          new, n = re.subn(r'(?m)^(  tag: ).*$', r'\g<1>"%s"' % tag, text, count=1)
+          if n != 1:
+              sys.exit(f"expected exactly one image tag line in {path}, replaced {n}")
+          open(path, "w").write(new)
+          PY
+
+          if git diff --quiet; then
+            echo "staging already points at $tag"
+            exit 0
+          fi
+
+          git config user.name  "${{ github.actor }}"
+          git config user.email "${{ github.actor }}@users.noreply.github.com"
+          git add "$file"
+          # [skip ci] so the tag commit does not start another pipeline, which
+          # would build an identical image and write an identical tag forever.
+          git commit -m "Deploy ${tag} to staging [skip ci]"
+          git push
+
+      - name: Summary
+        run: |
+          {
+            echo "### Staging"
+            echo
+            echo "Image \`${{ needs.build.outputs.tag }}\` written to \`values-staging.yaml\`."
+            echo "ArgoCD syncs it from git; nothing in this pipeline touched a cluster."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Production — behind an approval
+  # ---------------------------------------------------------------------------
+
+  production:
+    name: Deploy to production
+    # Deliberately depends on nothing. Promotion reads the tag staging is
+    # already running out of git and copies it across, so it needs no build
+    # output — and a `needs: [staging]` would be worse than redundant: staging
+    # does not run on a workflow_dispatch, and a skipped dependency skips its
+    # dependents, so the promote path could never fire.
+    if: github.event_name == 'workflow_dispatch' && inputs.promote
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The approval lives here rather than on an ArgoCD sync button, and the
+    # distinction matters. A human clicking Sync means git no longer describes
+    # production — the commit is merged, the cluster is not running it, and
+    # reverting the commit would not roll production back. Gating the commit
+    # keeps git true, so a rollback stays a revert.
+    #
+    # Configure required reviewers on the "production" environment in the
+    # repository settings; without them this gate is decorative.
+    environment:
+      name: production
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Production is promoted from whatever staging is running, not built
+      # again. Rebuilding could produce a different image from the same source —
+      # a moved base image, a different toolchain patch — so the artifact that
+      # was exercised in staging is the one that ships.
+      - name: Promote the image staging is running
+        run: |
+          set -euo pipefail
+          staging=deploy/helm/raftkv/values-staging.yaml
+          production=deploy/helm/raftkv/values-production.yaml
+
+          # Reading the tag and writing it are one script, so the value cannot
+          # be mangled by a round trip through the shell.
+          tag=$(python3 - "$staging" "$production" <<'PY'
+          import re, sys
+          staging, production = sys.argv[1], sys.argv[2]
+
+          found = re.search(r'(?m)^  tag: *"?([^"\n]+)"?$', open(staging).read())
+          if not found:
+              sys.exit(f"no image tag found in {staging}")
+          tag = found.group(1).strip()
+
+          text = open(production).read()
+          new, n = re.subn(r'(?m)^(  tag: ).*$', lambda m: m.group(1) + f'"{tag}"', text, count=1)
+          if n != 1:
+              sys.exit(f"expected exactly one image tag line in {production}, replaced {n}")
+          open(production, "w").write(new)
+          print(tag)
+          PY
+          )
+          echo "promoting $tag"
+
+          if git diff --quiet; then
+            echo "production already runs $tag"
+            exit 0
+          fi
+
+          git config user.name  "${{ github.actor }}"
+          git config user.email "${{ github.actor }}@users.noreply.github.com"
+          git add "$production"
+          git commit -m "Promote ${tag} to production [skip ci]"
+          git push
+
+          {
+            echo "### Production"
+            echo
+            echo "Promoted \`${tag}\`, the image staging was running."
+            echo "Rolling back is \`git revert\` of this commit."
+          } >> "$GITHUB_STEP_SUMMARY"

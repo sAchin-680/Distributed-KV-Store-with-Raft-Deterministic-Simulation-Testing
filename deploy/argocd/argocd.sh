@@ -18,8 +18,8 @@
 set -euo pipefail
 
 NAMESPACE="${NAMESPACE:-argocd}"
-APP="${APP:-raftkv}"
-APP_NAMESPACE="${APP_NAMESPACE:-default}"
+APP="${APP:-raftkv-staging}"
+APP_NAMESPACE="${APP_NAMESPACE:-raftkv-staging}"
 RELEASE="${RELEASE:-kv}"
 ARGOCD_VERSION="${ARGOCD_VERSION:-v2.13.2}"
 UI_PORT="${UI_PORT:-8080}"
@@ -36,60 +36,27 @@ argo() { k get application "$APP" -o jsonpath="$1" 2>/dev/null; }
 sync_status() { argo '{.status.sync.status}'; }
 health_status() { argo '{.status.health.status}'; }
 
-# ---------------------------------------------------------------------------
-
-up() {
-	log "installing ArgoCD ${ARGOCD_VERSION}"
-	kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
-	kubectl apply -n "$NAMESPACE" -f \
-		"https://raw.githubusercontent.com/argoproj/argo-cd/${ARGOCD_VERSION}/manifests/install.yaml" >/dev/null
-
-	log "waiting for the control plane"
-	k wait --for=condition=Available deployment --all --timeout=600s
-
-	# The chart is currently installed by Helm directly. Two things reconciling
-	# the same resources disagree sooner or later, so ownership is handed over
-	# rather than shared. The volumes survive: a StatefulSet's PVCs are
-	# deliberately not deleted with it, so the Raft log and each node's term and
-	# vote are still on disk when ArgoCD recreates the pods.
-	if helm status "$RELEASE" --namespace "$APP_NAMESPACE" >/dev/null 2>&1; then
-		log "handing the release over from Helm to ArgoCD (volumes are kept)"
-		helm uninstall "$RELEASE" --namespace "$APP_NAMESPACE" >/dev/null
-	fi
-
-	log "creating the Application"
-	kubectl apply -f "$HERE/application.yaml" >/dev/null
-
-	log "waiting for the first sync"
-	local deadline=$((SECONDS + 300))
-	while ((SECONDS < deadline)); do
-		if [[ "$(sync_status)" == Synced && "$(health_status)" == Healthy ]]; then
-			log "synced and healthy"
-			status
-			return 0
-		fi
-		sleep 5
-	done
-
-	log "did not reach Synced/Healthy in time"
-	status
-	k get application "$APP" -o jsonpath='{.status.conditions}' | head -c 2000
-	echo
-	return 1
-}
-
-down() {
-	kubectl delete -f "$HERE/application.yaml" --ignore-not-found --timeout=120s || true
-	kubectl delete namespace "$NAMESPACE" --ignore-not-found
-}
+# The image tag each environment is pinned to, read straight out of the values
+# file the pipeline writes. Anchored on the one "  tag:" line rather than a
+# window after "image:", because the comment block above the tag varies in
+# length between the two files and a fixed -A window silently misses it.
+pinned_tag() { sed -n 's/^  tag: *//p' "$1" 2>/dev/null | tr -d '"' | head -1; }
 
 status() {
-	printf '  application:  %s / %s\n' "$(sync_status)" "$(health_status)"
-	printf '  tracking:     %s\n' "$(argo '{.spec.source.repoURL}')"
-	printf '  revision:     %s @ %s\n' "$(argo '{.spec.source.targetRevision}')" "$(argo '{.status.sync.revision}' | cut -c1-8)"
-	printf '  pods:         %s ready\n' \
-		"$(app get pods -l "app.kubernetes.io/instance=${RELEASE}" \
-			-o jsonpath='{range .items[*]}{.status.containerStatuses[0].ready}{"\n"}{end}' 2>/dev/null | grep -c true || echo 0)"
+	for a in raftkv-staging raftkv-production; do
+		# The Application name is also its namespace: both come from the
+		# environment name, so they are derived rather than coincidental.
+		printf '  %-18s %-10s %-9s %s pods   %s\n' "$a" \
+			"$(k get application "$a" -o jsonpath='{.status.sync.status}' 2>/dev/null)" \
+			"$(k get application "$a" -o jsonpath='{.status.health.status}' 2>/dev/null)" \
+			"$(kubectl -n "$a" get pods -l app.kubernetes.io/name=raftkv \
+				-o jsonpath='{range .items[*]}{.status.containerStatuses[0].ready}{"\n"}{end}' 2>/dev/null | grep -c true || echo 0)" \
+			"$(k get application "$a" -o jsonpath='{.status.sync.revision}' 2>/dev/null | cut -c1-8)"
+	done
+	printf '  tracking:          %s @ %s\n' \
+		"$(argo '{.spec.source.repoURL}')" "$(argo '{.spec.source.targetRevision}')"
+	printf '  staging image:     %s\n' "$(pinned_tag "$HERE/../helm/raftkv/values-staging.yaml")"
+	printf '  production image:  %s\n' "$(pinned_tag "$HERE/../helm/raftkv/values-production.yaml")"
 }
 
 # Breaks the cluster the way a person would, and times the correction.

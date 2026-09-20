@@ -327,6 +327,38 @@ Commit index before and after the handover: **344,703**. The cluster never
 noticed the thing managing it had changed.
 [deploy/argocd/](deploy/argocd/) has the rest.
 
+### Staging and production, gated on the fuzz suite
+
+Two Applications read the same chart with different value files — staging runs
+three nodes, production five — so staging stays a rehearsal rather than a
+different system.
+
+The pipeline never touches a cluster. It builds an image tagged with the commit
+SHA, writes that tag into a values file, and commits; ArgoCD does the rest. That
+keeps the deployed version knowable from the repository and revertible by
+reverting a commit.
+
+```
+verify  ──>  build  ──>  staging  ──>  production
+  │                                        │
+  fuzz campaign, mutation gate,            manual approval
+  race suite, determinism guards
+```
+
+**Everything is downstream of the correctness gate**, and that ordering is
+deliberate rather than conventional. A consensus bug does not announce itself —
+it is a stale read served once under a partition that healed, or a committed
+entry lost in an election nobody noticed. Catching it in staging needs the same
+unlucky interleaving that hid it in testing, so "deploy and watch" is not the
+safety net here that it is for a web service. The simulator searches those
+interleavings on purpose, and it is the only thing in the pipeline that can.
+
+Production's approval gates the **commit**, not the sync. A human clicking Sync
+in ArgoCD would mean git no longer describes production: the commit is merged,
+the cluster is not running it, and reverting would not roll back. Gating the
+commit keeps git true, so a rollback stays a revert.
+[.github/workflows/cd.yml](.github/workflows/cd.yml) is the pipeline.
+
 ## Measured
 
 Core-only numbers — no disk, no network, no goroutines. They say how much
@@ -522,7 +554,8 @@ Built in milestones, each with an explicit exit criterion rather than a vibe.
 | done | Rolling upgrade under load, measured against a live cluster |
 | done | Prometheus rules, Alertmanager, Grafana dashboard, alerts fired on purpose |
 | done | GitOps with ArgoCD, drift broken on purpose and corrected in two seconds |
-| next | Continuous deployment gated on the fuzz suite, and Terraform |
+| done | Staging and production environments, deployment gated on the fuzz suite |
+| next | The fuzz write-up, and Terraform |
 
 ## Documentation
 

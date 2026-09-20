@@ -1,0 +1,105 @@
+# Staging and production, as two Applications following the same chart with
+# different value files.
+#
+# Same chart deliberately. If staging ran different manifests it would stop
+# being a rehearsal, and the class of bug it exists to catch — the one that only
+# appears on a real cluster — would be exactly the class it stopped covering.
+# What differs is the values, and the values are in git.
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: raftkv
+  namespace: argocd
+spec:
+  description: The replicated key/value store
+
+  sourceRepos:
+    - https://github.com/sAchin-680/Distributed-KV-Store-with-Raft-Deterministic-Simulation-Testing.git
+
+  destinations:
+    - {server: https://kubernetes.default.svc, namespace: raftkv-staging}
+    - {server: https://kubernetes.default.svc, namespace: raftkv-production}
+
+  # An Application with selfHeal is an agent holding write access to the
+  # cluster: whatever it is permitted to create is what a compromised repository
+  # can create. So the list is the smallest one that works.
+  #
+  # Namespace is the single cluster-scoped exception, and it is required rather
+  # than convenient: the Applications use CreateNamespace=true, and creating a
+  # namespace is a cluster-scoped operation. With an empty whitelist every sync
+  # fails with "resource :Namespace is not permitted in project raftkv" before
+  # a single workload is created. Granting it is still far narrower than the
+  # default project, which permits everything including RBAC.
+  clusterResourceWhitelist:
+    - {group: "", kind: Namespace}
+  namespaceResourceWhitelist:
+    - {group: "", kind: Service}
+    - {group: apps, kind: StatefulSet}
+    - {group: policy, kind: PodDisruptionBudget}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: raftkv-staging
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: raftkv
+  source:
+    repoURL: https://github.com/sAchin-680/Distributed-KV-Store-with-Raft-Deterministic-Simulation-Testing.git
+    targetRevision: main
+    path: deploy/helm/raftkv
+    helm:
+      releaseName: kv
+      valueFiles: [values-staging.yaml]
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: raftkv-staging
+  syncPolicy:
+    automated: {selfHeal: true, prune: true}
+    syncOptions: [CreateNamespace=true, ApplyOutOfSyncOnly=true]
+    retry:
+      limit: 5
+      backoff: {duration: 5s, factor: 2, maxDuration: 3m}
+  revisionHistoryLimit: 10
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: raftkv-production
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: raftkv
+  source:
+    repoURL: https://github.com/sAchin-680/Distributed-KV-Store-with-Raft-Deterministic-Simulation-Testing.git
+    targetRevision: main
+    path: deploy/helm/raftkv
+    helm:
+      releaseName: kv
+      valueFiles: [values-production.yaml]
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: raftkv-production
+  # Production syncs automatically too, and the approval gate lives in the
+  # pipeline rather than here. That is the opposite of the obvious arrangement,
+  # so it is worth saying why.
+  #
+  # A human clicking Sync in ArgoCD means git no longer describes production:
+  # the commit is merged, the cluster is not running it, and the difference
+  # exists only in someone's intent. Reverting the commit would then not roll
+  # production back, which removes the one property that makes this worth doing.
+  #
+  # So the approval gates the *commit* that changes the production image tag,
+  # not the sync. Once the tag is in git, git is true again, and a rollback is a
+  # revert.
+  syncPolicy:
+    automated: {selfHeal: true, prune: true}
+    syncOptions: [CreateNamespace=true, ApplyOutOfSyncOnly=true]
+    retry:
+      limit: 5
+      backoff: {duration: 5s, factor: 2, maxDuration: 3m}
+  revisionHistoryLimit: 10
