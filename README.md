@@ -18,8 +18,8 @@ is enough for anyone to replay the identical failure, byte for byte, forever.
 
 > **Status:** in active development. Consensus is complete — election,
 > replication, snapshotting, linearizable reads and joint-consensus membership
-> changes — and a real cluster serves clients over gRPC. Chaos testing and
-> deployment come next. See [Status](#status) for details.
+> changes — and a containerised cluster has been checked for linearizability
+> under real network faults. Deployment comes next. See [Status](#status).
 
 ```text
                      ┌───────────────────────────────────────────────┐
@@ -152,6 +152,53 @@ committed prefix.
 
 Those are not implementation bugs. They are the predicted consequence of breaking
 a documented assumption, used as a control.
+
+## Chaos and linearizability
+
+The simulator proves the *algorithm* under adversarial scheduling by reading each
+node's internal state. It says nothing about the *implementation*: it replaces
+gRPC with an in-memory queue, bbolt with a map, and the Go scheduler with a
+single-threaded loop. This closes that gap.
+
+Five containers, `tc`/`netem` applying 60ms ±40ms delay, 3% loss and 5%
+reordering, three `iptables` partitions and two `SIGKILL`s on a schedule, while
+ten concurrent clients drive the store. Every operation's invocation, completion
+and result is recorded, and the history is checked with
+[Porcupine](https://github.com/anishathalye/porcupine): *could a single machine,
+executing these one at a time, have produced these answers?*
+
+```bash
+make chaos-up      # five-node cluster in containers
+make chaos-run     # faults and workload together, then check the history
+make chaos-down
+```
+
+| Run | Clients | Operations | Unknown outcome | Result |
+| --- | --- | --- | --- | --- |
+| 1 | 10 | 3,835 | 326 (8.5%) | undecided |
+| 2 | 10 | 3,471 | 325 (9.4%) | linearizable |
+| 3 | 10 | 3,327 | 309 (9.3%) | linearizable |
+| 4 | 5 | 341 | 116 (34%) | linearizable |
+
+Recorded histories and the full account are in
+[docs/chaos-runs/](docs/chaos-runs/).
+
+**Operations whose outcome the client never learned are kept**, not discarded. A
+write that timed out may have committed anyway — the *answer* was lost, not
+necessarily the command — so it is recorded as invoked-and-never-returned and the
+checker is free to place it either way. Dropping them would remove exactly the
+operations most likely to be involved in a violation.
+
+**An inconclusive search is not a pass.** Porcupine's search is exponential in
+concurrent operations; when it runs out of time the result is `UNKNOWN` and
+`chaosctl` exits non-zero. A history that could not be decided has not been shown
+to be legal.
+
+**The first runs failed, and the harness was at fault.** Reads were returning
+values absent from that run's history — written by the *previous* run, because
+container volumes persist. The checker was right; the history was not
+self-contained. Fixed by namespacing each run's keys, and written up in full
+rather than quietly corrected.
 
 ## Measured
 
@@ -312,6 +359,7 @@ implementations skip.
 ```text
 raft/         the consensus core — pure, deterministic, no I/O and no goroutines
 sim/          deterministic simulator, fault injection, safety checker
+chaos/        client workload recorder and the Porcupine linearizability model
 node/         the driver: one goroutine per node, owning all Raft state
 storage/      durable bbolt storage
 transport/    peer transport: the interface and its gRPC implementation
@@ -320,7 +368,8 @@ kvstore/      the replicated state machine, with client-session deduplication
 kvserver/     the client-facing gRPC API and a cluster-aware client
 codec/        conversion between core types and protobuf
 proto/        protobuf definitions and generated code
-cmd/          raftd, kvctl, simctl
+cmd/          raftd, kvctl, simctl, chaosctl
+deploy/       container compose file and the tc/netem chaos scripts
 docs/         architecture notes and decision records
 scripts/      determinism guards and the mutation suite
 ```
