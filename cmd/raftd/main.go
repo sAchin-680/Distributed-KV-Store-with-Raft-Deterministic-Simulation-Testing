@@ -27,6 +27,7 @@ import (
 	"github.com/sAchin-680/raftkv/internal/buildinfo"
 	"github.com/sAchin-680/raftkv/kvserver"
 	"github.com/sAchin-680/raftkv/kvstore"
+	"github.com/sAchin-680/raftkv/metrics"
 	"github.com/sAchin-680/raftkv/node"
 	"github.com/sAchin-680/raftkv/raft"
 	"github.com/sAchin-680/raftkv/storage"
@@ -44,6 +45,7 @@ type options struct {
 	id            uint64
 	listen        string
 	clientListen  string
+	metricsListen string
 	dataDir       string
 	peers         string
 	tickInterval  time.Duration
@@ -60,6 +62,10 @@ func run() error {
 	var o options
 	flag.Uint64Var(&o.id, "id", 0, "this node's identity (required, non-zero)")
 	flag.StringVar(&o.listen, "listen", ":9001", "address to serve peer traffic on")
+	flag.StringVar(&o.metricsListen, "metrics-listen", "",
+		"address to serve /metrics, /readyz and /livez on (empty disables it)\n"+
+			"\tSeparate from the other ports so scraping keeps working when the\n"+
+			"\tclient API is overloaded, which is when it is needed most.")
 	flag.StringVar(&o.clientListen, "client-listen", "",
 		"address to serve the client API on (empty disables it)\n"+
 			"\tKept separate from --listen so a flood of client traffic cannot\n"+
@@ -148,10 +154,19 @@ func run() error {
 		}
 	}
 
+	var metricsAPI *metrics.Server
+	if o.metricsListen != "" {
+		metricsAPI, err = metrics.Serve(o.metricsListen, n, logger)
+		if err != nil {
+			return err
+		}
+	}
+
 	log.Info("raftd running",
 		"version", buildinfo.Version,
 		"listen", tr.Addr(),
 		"client_listen", o.clientListen,
+		"metrics_listen", o.metricsListen,
 		"data", dbPath,
 		"peers", len(peers),
 		"election_timeout", time.Duration(o.electionTick)*o.tickInterval)
@@ -176,6 +191,11 @@ func run() error {
 	// transport lets it exit on its own signal rather than on a closed channel.
 	if clientAPI != nil {
 		clientAPI.Stop()
+	}
+	// Metrics last among the servers: a shutting-down node is exactly when a
+	// scrape is worth having.
+	if metricsAPI != nil {
+		metricsAPI.Stop()
 	}
 	n.Stop()
 	if err := tr.Close(); err != nil {
