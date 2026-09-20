@@ -5,6 +5,11 @@
 /bin/
 /dist/
 
+# Scratch output from local chaos runs. Runs worth keeping go in
+# docs/chaos-runs/ instead, because a recorded history is the evidence a run
+# produced and a result nobody can inspect afterwards is only an assertion.
+/.chaos-runs/
+
 # Test & simulation artifacts
 *.out
 *.test
