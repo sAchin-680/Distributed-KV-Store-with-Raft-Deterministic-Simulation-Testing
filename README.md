@@ -18,8 +18,10 @@ is enough for anyone to replay the identical failure, byte for byte, forever.
 
 > **Status:** in active development. Consensus is complete — election,
 > replication, snapshotting, linearizable reads and joint-consensus membership
-> changes — and a containerised cluster has been checked for linearizability
-> under real network faults. Deployment comes next. See [Status](#status).
+> changes. A containerised cluster has been checked for linearizability under
+> real network faults, and the cluster runs on Kubernetes, where every node can
+> be replaced under load without losing quorum. Infrastructure automation and
+> the continuous-deployment path are next. See [Status](#status).
 
 ```text
                      ┌───────────────────────────────────────────────┐
@@ -199,6 +201,57 @@ values absent from that run's history — written by the *previous* run, because
 container volumes persist. The checker was right; the history was not
 self-contained. Fixed by namespacing each run's keys, and written up in full
 rather than quietly corrected.
+
+## Running on Kubernetes
+
+Five nodes as a StatefulSet with per-pod volumes, a headless Service so peers can
+be addressed individually, and a PodDisruptionBudget set to quorum.
+
+```bash
+make kind-up       # local Kubernetes cluster
+make deploy        # build, load the image, install the chart
+make rollout       # replace every node under load, then check the history
+make undeploy
+```
+
+Node identity comes from the pod ordinal, so `kv-raftkv-3` is always node 4, with
+always the same disk. That is not cosmetic. A Raft node's ID appears in the
+replicated configuration and its vote and log live on disk; a node that came back
+as a *different* node would leave the old one permanently unreachable in the
+configuration, and a handful of restarts would put the cluster below quorum
+against members that no longer exist. [ADR-0004](docs/adr/0004-statefulset-not-deployment.md)
+works through what a Deployment breaks, one failure at a time.
+
+Two settings are required rather than preferred, and both exist to break the same
+bootstrap cycle: a pod is not Ready until there is a leader, a leader needs a
+majority, and a majority needs pods. `podManagementPolicy: Parallel` stops the
+default ordered startup deadlocking at pod 0, and `publishNotReadyAddresses: true`
+lets peers resolve each other before any of them is Ready.
+
+### A rolling upgrade costs 0.0116% of operations
+
+Every node in a five-node cluster replaced, one at a time, while eight clients
+drove reads, writes and deletes without pausing.
+
+| | |
+| --- | --- |
+| Operations | 138,129 in 2m00s (~1,150/sec) |
+| Outcome unknown | **16 — 0.0116%** |
+| Linearizable | yes, checked in 156ms |
+| Pods replaced | 5 of 5, in 161s |
+| Cluster after | every node at the same term, commit and applied index |
+
+Sixteen, not zero, and the difference is worth being exact about. Those are the
+operations already in flight on the leader when its pod was terminated — the
+client sent them and no answer is coming. Everything else retried against the
+next endpoint and succeeded. The window is bounded by one election, 1–2s by
+construction; at this rate a cluster that genuinely stopped serving would have
+lost thousands of operations rather than sixteen, because four of five nodes hold
+a majority throughout.
+
+The workload runs *inside* the cluster. A port-forward dies with its target pod,
+and the resulting errors would be the harness failing rather than the store.
+Full account in [docs/rollout/](docs/rollout/).
 
 ## Measured
 
@@ -389,9 +442,11 @@ Built in milestones, each with an explicit exit criterion rather than a vibe.
 | done | KV state machine, read-index linearizable reads, client API, `kvctl` |
 | done | Snapshotting, log compaction, and `InstallSnapshot` |
 | done | Joint-consensus membership changes |
-| next | `tc`/`netem` chaos and linearizability checking |
-| | Randomized testing at scale, with bugs found and documented |
-| | Kubernetes, Terraform, ArgoCD, CI correctness gate |
+| done | `tc`/`netem` chaos and linearizability checking |
+| done | Randomized testing at scale, with bugs found and documented |
+| done | Prometheus metrics, health endpoints, Helm chart, Kubernetes deployment |
+| done | Rolling upgrade under load, measured against a live cluster |
+| next | Terraform, ArgoCD, and the continuous-deployment correctness gate |
 
 ## Documentation
 
@@ -399,6 +454,9 @@ Built in milestones, each with an explicit exit criterion rather than a vibe.
 - [ADR-0001](docs/adr/0001-pure-deterministic-core.md) — why the consensus core has no clock, I/O or goroutines
 - [ADR-0002](docs/adr/0002-synchronous-persistence.md) — what fsync costs, measured, and the ceiling it sets
 - [ADR-0003](docs/adr/0003-read-index.md) — why the obvious read is wrong, and why not a leader lease
+- [ADR-0004](docs/adr/0004-statefulset-not-deployment.md) — what a Deployment breaks, and the two settings that are required rather than preferred
+- [Chaos runs](docs/chaos-runs/) — histories recorded under real network faults, including the run that stayed undecided
+- [Rolling upgrade](docs/rollout/) — replacing every node under load, and the sixteen operations it cost
 
 ## References
 

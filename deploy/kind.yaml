@@ -1,0 +1,9 @@
+# A three-node kind cluster, so pod anti-affinity has somewhere to spread to and
+# a node drain is a real operation rather than a no-op.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: raftkv
+nodes:
+  - role: control-plane
+  - role: worker
+  - role: worker

@@ -22,7 +22,8 @@ RUN CGO_ENABLED=0 go build -trimpath \
       -X github.com/sAchin-680/raftkv/internal/buildinfo.Commit=${COMMIT} \
       -X github.com/sAchin-680/raftkv/internal/buildinfo.Date=${DATE}" \
     -o /out/raftd ./cmd/raftd && \
-    CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/kvctl ./cmd/kvctl
+    CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/kvctl ./cmd/kvctl && \
+    CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/chaosctl ./cmd/chaosctl
 
 # Runtime --------------------------------------------------------------------
 # What actually ships: the binaries, a CA bundle, and nothing else. No shell, no
@@ -36,6 +37,10 @@ RUN apk add --no-cache ca-certificates && \
 
 COPY --from=builder /out/raftd /usr/local/bin/raftd
 COPY --from=builder /out/kvctl /usr/local/bin/kvctl
+# The workload recorder ships alongside the server so a rolling upgrade can be
+# measured from inside the cluster, where the client sees the same network the
+# nodes do rather than a port-forward that breaks when a pod restarts.
+COPY --from=builder /out/chaosctl /usr/local/bin/chaosctl
 
 USER raft
 VOLUME /data
