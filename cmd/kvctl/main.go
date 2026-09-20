@@ -17,6 +17,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -36,8 +37,11 @@ func run() error {
 	var (
 		endpoints = flag.String("endpoints", "localhost:8001",
 			"comma-separated client addresses of the cluster")
-		timeout = flag.Duration("timeout", 5*time.Second, "per-command timeout")
-		stale   = flag.Bool("stale", false,
+		timeout = flag.Duration("timeout", 5*time.Second,
+			"per-command timeout\n"+
+				"\tA membership change is two commits rather than one, so it is\n"+
+				"\tgiven longer than this by default.")
+		stale = flag.Bool("stale", false,
 			"read from whichever node answers, without confirming leadership\n"+
 				"\tFast, and may return an arbitrarily out-of-date value.")
 		noSession = flag.Bool("no-session", false,
@@ -66,7 +70,11 @@ func run() error {
 	}
 	defer func() { _ = client.Close() }()
 
-	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	commandTimeout := *timeout
+	if args[0] == "members" {
+		commandTimeout = max(commandTimeout, membershipTimeout)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
 	defer cancel()
 
 	// Writes register a session first, so a retry after a timeout is recognized
@@ -127,6 +135,21 @@ func run() error {
 	case "status":
 		return printStatus(ctx, client)
 
+	case "members":
+		if len(args) < 2 {
+			return errors.New("usage: kvctl members <id> [<id>...]")
+		}
+		voters, err := parseIDs(args[1:])
+		if err != nil {
+			return err
+		}
+		resp, err := client.ChangeMembership(ctx, voters)
+		if err != nil {
+			return describe(err)
+		}
+		fmt.Printf("cluster is now %v (committed at index %d)\n",
+			resp.GetConfig().GetVoters(), resp.GetIndex())
+
 	default:
 		usage()
 		return fmt.Errorf("unknown command %q", args[0])
@@ -137,6 +160,10 @@ func run() error {
 // statusTimeout bounds each node's status call, so one unreachable node cannot
 // consume the whole command timeout and leave the rest unqueried.
 const statusTimeout = 2 * time.Second
+
+// membershipTimeout is the floor for a membership change, which is two commits
+// and a round of catching the new member up rather than a single write.
+const membershipTimeout = 30 * time.Second
 
 // printStatus asks every endpoint what it believes, rather than following the
 // leader. Disagreement between nodes is the interesting part — a node that
@@ -195,6 +222,21 @@ func describe(err error) error {
 	return err
 }
 
+func parseIDs(args []string) ([]uint64, error) {
+	out := make([]uint64, 0, len(args))
+	for _, a := range args {
+		id, err := strconv.ParseUint(strings.TrimSpace(a), 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("%q is not a node id: %w", a, err)
+		}
+		if id == 0 {
+			return nil, fmt.Errorf("node id 0 is reserved to mean 'no node'")
+		}
+		out = append(out, id)
+	}
+	return out, nil
+}
+
 func splitEndpoints(s string) []string {
 	var out []string
 	for _, part := range strings.Split(s, ",") {
@@ -213,10 +255,18 @@ Usage:
   kvctl [flags] get <key>
   kvctl [flags] delete <key>
   kvctl [flags] status
+  kvctl [flags] members <id> [<id>...]
 
 Reads are linearizable by default: the node confirms with a quorum that it is
 still the leader before answering, so a partitioned leader returns an error
 rather than a stale value. Pass --stale to skip that.
+
+"members" lists the complete new voter set, not a delta. The cluster moves there
+through a joint configuration that needs majorities of both the old and new
+membership, so the two can never elect separate leaders mid-change. The command
+returns once the whole transition has finished. A node must already be running
+and reachable before it can be added: joining changes who is counted, not who
+exists.
 
 Flags:
 `)

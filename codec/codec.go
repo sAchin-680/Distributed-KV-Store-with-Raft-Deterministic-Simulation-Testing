@@ -191,39 +191,12 @@ func UnmarshalSnapshot(b []byte) (raft.Snapshot, error) {
 	return SnapshotFromProto(&p), nil
 }
 
-// ---------------------------------------------------------------------------
-// Configuration changes
-// ---------------------------------------------------------------------------
-
-// MarshalConfChange encodes a configuration change for the log entry that
-// carries it.
-func MarshalConfChange(cc raft.ConfChange) ([]byte, error) {
-	kind := raftpb.ConfChange_KIND_ENTER_JOINT
-	if cc.Kind == raft.ConfChangeLeaveJoint {
-		kind = raftpb.ConfChange_KIND_LEAVE_JOINT
-	}
-	b, err := proto.Marshal(&raftpb.ConfChange{
-		Kind:   kind,
-		Config: ConfigurationToProto(cc.Config),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("codec: marshalling conf change: %w", err)
-	}
-	return b, nil
-}
-
-// UnmarshalConfChange decodes a configuration change from a log entry.
-func UnmarshalConfChange(b []byte) (raft.ConfChange, error) {
-	var p raftpb.ConfChange
-	if err := proto.Unmarshal(b, &p); err != nil {
-		return raft.ConfChange{}, fmt.Errorf("codec: unmarshalling conf change: %w", err)
-	}
-	kind := raft.ConfChangeEnterJoint
-	if p.GetKind() == raftpb.ConfChange_KIND_LEAVE_JOINT {
-		kind = raft.ConfChangeLeaveJoint
-	}
-	return raft.ConfChange{Kind: kind, Config: ConfigurationFromProto(p.GetConfig())}, nil
-}
+// Configuration changes are encoded by the raft package itself, not here.
+//
+// The core applies a membership change when it *appends* the entry rather than
+// handing it to the application, so it has to be able to read one. That makes a
+// single definition in the package that cannot do without it the right answer;
+// a second encoding here would be one more thing to keep in step.
 
 // ---------------------------------------------------------------------------
 // Hard state

@@ -216,6 +216,22 @@ func (c *Client) get(ctx context.Context, key []byte, level kvpb.ReadConsistency
 	return value, found, err
 }
 
+// ChangeMembership moves the cluster to a new set of voters, returning once the
+// whole transition has completed rather than once it was accepted.
+func (c *Client) ChangeMembership(ctx context.Context, voters []uint64) (*kvpb.ChangeMembershipResponse, error) {
+	var resp *kvpb.ChangeMembershipResponse
+	err := c.call(ctx, func(ctx context.Context, conn *grpc.ClientConn) error {
+		out, err := kvpb.NewClusterClient(conn).ChangeMembership(ctx,
+			&kvpb.ChangeMembershipRequest{Voters: voters})
+		if err != nil {
+			return err
+		}
+		resp = out
+		return nil
+	})
+	return resp, err
+}
+
 // Status reads one node's view of the cluster, without redirecting: the point
 // of asking a particular node is to hear what that node believes.
 func (c *Client) Status(ctx context.Context, endpoint string) (*kvpb.StatusResponse, error) {

@@ -268,6 +268,52 @@ MUTATIONS: list[Mutation] = [
         "compacted log still has — a fraction of its state, silently.",
         pkg="./node/",
     ),
+    Mutation(
+        name="membership/change-applied-on-commit-not-append",
+        file="raft/replication.go",
+        old="""	if e.Type == EntryConfChange {
+		if err := r.refreshConfiguration(); err != nil {
+			return 0, err
+		}
+	}""",
+        new="""	_ = e.Type""",
+        expect="TestMembershipChangePassesThroughAJointConfiguration",
+        why="Committing a change needs votes counted under the new configuration, "
+        "so a node that waits for the commit votes under a configuration it is "
+        "replacing and the change can never commit itself.",
+    ),
+    Mutation(
+        name="membership/truncated-change-is-not-reverted",
+        file="raft/replication.go",
+        old="""		if e.Type == EntryConfChange || (r.confIndex > 0 && e.Index <= r.confIndex) {""",
+        new="""		if e.Type == EntryConfChange {""",
+        expect="TestTruncatingAConfChangeRevertsTheConfiguration",
+        why="A change overwritten by a different leader leaves the node believing "
+        "in a membership no log contains — and counting quorums against it.",
+    ),
+    Mutation(
+        name="membership/two-changes-in-flight-at-once",
+        file="raft/confchange.go",
+        old="""	if r.confIndex > r.log.committed {
+		return 0, ErrConfChangeInProgress
+	}""",
+        new="""	_ = r.confIndex""",
+        expect="TestChangeIsRefusedWhileLeavingJointIsUncommitted",
+        why="Two overlapping changes reintroduce exactly the ambiguity joint "
+        "consensus removes: two configurations that can each elect a leader.",
+    ),
+    Mutation(
+        name="membership/joint-quorum-needs-only-one-half",
+        file="raft/config.go",
+        old="""	if c.IsJoint() && !hasMajority(c.OldVoters, granted) {
+		return false
+	}""",
+        new="""	_ = c.OldVoters""",
+        expect="TestQuorumJointRequiresBothHalves|TestJointConfigurationForcesTheTwoHalvesToOverlap",
+        why="The two halves stop being forced to overlap, so the old and new "
+        "configurations can elect separate leaders at the same instant — the "
+        "exact failure joint consensus exists to prevent.",
+    ),
 ]
 
 

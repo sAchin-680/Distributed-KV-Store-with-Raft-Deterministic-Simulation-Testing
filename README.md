@@ -16,10 +16,10 @@ random source, and reproduces any execution exactly.
 When a randomized run finds a safety violation, it prints one number. That number
 is enough for anyone to replay the identical failure, byte for byte, forever.
 
-> **Status:** in active development. The store works end to end — a real cluster
-> elects a leader, replicates writes to durable storage, compacts its log into
-> snapshots, and serves linearizable reads to clients over gRPC. Membership
-> changes come next. See [Status](#status) for what is built and what is coming.
+> **Status:** in active development. Consensus is complete — election,
+> replication, snapshotting, linearizable reads and joint-consensus membership
+> changes — and a real cluster serves clients over gRPC. Chaos testing and
+> deployment come next. See [Status](#status) for details.
 
 ```text
                      ┌───────────────────────────────────────────────┐
@@ -85,14 +85,15 @@ no safety violations
 | | |
 | --- | --- |
 | Seeds | 10,000 |
-| Simulated events | 2,031,338,664 |
-| Entries committed | 12,932,095 |
-| Cluster time simulated | **83.3 hours in 4 minutes** — 1,206× real time |
+| Simulated events | 1,713,783,733 |
+| Entries committed | 12,257,429 |
+| Cluster time simulated | **83.3 hours in 3m38s** — 1,376× real time |
 | Safety violations | **0** |
 
-Snapshotting is exercised throughout: a typical run takes over a hundred
-snapshots and transfers roughly a hundred of them to followers that had fallen
-behind the start of the leader's log.
+Every feature is exercised throughout rather than mentioned. A typical
+thirty-second run takes **100+ snapshots**, transfers ~70 of them to followers
+that fell behind the start of the leader's log, and performs **~9 membership
+changes** — all while partitioning, crashing and restarting nodes.
 
 Checked after every single event: at most one leader per term, no committed entry
 ever changes, commit index never decreases, applied never exceeds committed. At
@@ -165,7 +166,7 @@ runs. Reproduce with `make bench` and `make mutation`.
 | Commit round, 5-node cluster | 3.13 µs — **320k commits/sec** |
 | Steady-state heartbeat, 3-node | 595 ns |
 | Leader election from cold start | **12.1 logical ticks** median |
-| Seeded bugs caught by the test suite | **18 / 18** |
+| Seeded bugs caught by the test suite | **22 / 22** |
 | Statement coverage of the core | 76.5% |
 | Test-to-code ratio | 0.98 : 1 |
 
@@ -184,7 +185,7 @@ both ways:
 
 ### Mutation testing
 
-`make mutation` seeds eighteen known Raft bugs — the classic ones, including Figure 8
+`make mutation` seeds twenty-two known Raft bugs — the classic ones, including Figure 8
 and index-first log comparison — and checks that the test named after each one
 actually fails. It runs in 2.2 s and gates CI.
 
@@ -285,6 +286,9 @@ bin/kvctl --endpoints=$E set greeting "hello world"
 bin/kvctl --endpoints=$E get greeting
 bin/kvctl --endpoints=$E --stale get greeting   # skips the leadership check
 bin/kvctl --endpoints=$E delete greeting
+
+# Membership changes name the complete new voter set, not a delta.
+bin/kvctl --endpoints=$E members 1 2
 ```
 
 `kvctl` is given the whole cluster, not one node. Leadership moves on its own
@@ -296,6 +300,12 @@ ENDPOINT         NODE  STATE     TERM  LEADER  COMMIT  APPLIED  LAG
 127.0.0.1:8002   2     follower  1     3       1       1        -
 127.0.0.1:8003   3     leader    1     3       1       1        0
 ```
+
+Membership changes pass through a **joint configuration** that requires
+majorities of *both* the old and new voter sets. That overlap is what makes it
+impossible for the two configurations to elect separate leaders mid-change — the
+failure a single-step change allows, and the part most from-scratch Raft
+implementations skip.
 
 ## Project layout
 
@@ -329,9 +339,9 @@ Built in milestones, each with an explicit exit criterion rather than a vibe.
 | done | bbolt storage, gRPC transport, node driver, `raftd` |
 | done | KV state machine, read-index linearizable reads, client API, `kvctl` |
 | done | Snapshotting, log compaction, and `InstallSnapshot` |
-| next | Joint-consensus membership changes |
+| done | Joint-consensus membership changes |
+| next | `tc`/`netem` chaos and linearizability checking |
 | | Randomized testing at scale, with bugs found and documented |
-| | `tc`/`netem` chaos and linearizability checking |
 | | Kubernetes, Terraform, ArgoCD, CI correctness gate |
 
 ## Documentation

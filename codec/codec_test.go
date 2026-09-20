@@ -136,30 +136,6 @@ func TestSnapshotRoundTripsEveryField(t *testing.T) {
 	}
 }
 
-func TestConfChangeRoundTrips(t *testing.T) {
-	for _, want := range []raft.ConfChange{
-		{Kind: raft.ConfChangeEnterJoint, Config: raft.Configuration{
-			Voters: []raft.NodeID{2, 3, 4}, OldVoters: []raft.NodeID{1, 2, 3},
-		}},
-		{Kind: raft.ConfChangeLeaveJoint, Config: raft.NewConfiguration([]raft.NodeID{2, 3, 4})},
-	} {
-		raw, err := codec.MarshalConfChange(want)
-		if err != nil {
-			t.Fatalf("MarshalConfChange: %v", err)
-		}
-		got, err := codec.UnmarshalConfChange(raw)
-		if err != nil {
-			t.Fatalf("UnmarshalConfChange: %v", err)
-		}
-		if got.Kind != want.Kind {
-			t.Errorf("kind %s, want %s", got.Kind, want.Kind)
-		}
-		if !got.Config.Equal(want.Config) {
-			t.Errorf("config %s, want %s", got.Config, want.Config)
-		}
-	}
-}
-
 // A log written by a newer version may contain entry types this build does not
 // know. Refusing to read it would turn a rolling upgrade into an outage, so an
 // unknown type decodes as a normal entry rather than failing.

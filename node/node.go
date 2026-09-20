@@ -85,6 +85,18 @@ type Config struct {
 	Peers   []transport.Peer
 	Storage raft.Storage
 
+	// Bootstrap is the initial voter set, if it is not simply every peer.
+	//
+	// Separate from Peers because the two answer different questions: Peers is
+	// who this node knows how to reach, Bootstrap is who is counted toward a
+	// majority. A node being added to a cluster is reachable before it is
+	// counted, and has to be — the leader cannot replicate to something it
+	// cannot address.
+	//
+	// Only consulted on a node that has never run. Once a log exists it is
+	// authoritative, so a stale flag cannot rewrite the cluster.
+	Bootstrap []raft.NodeID
+
 	Transport    transport.Transport
 	Clock        clock.Clock
 	StateMachine StateMachine
@@ -200,6 +212,7 @@ type Node struct {
 	proposeCh chan *proposal
 	statusCh  chan chan Status
 	readCh    chan *readRequest
+	confCh    chan *confChangeRequest
 
 	// pending and pendingReads are owned by run() too.
 	pending      map[raft.Index]awaiting
@@ -221,12 +234,15 @@ func Start(cfg Config) (*Node, error) {
 		return nil, err
 	}
 
-	voters := make([]raft.NodeID, 0, len(cfg.Peers)+1)
-	for _, p := range cfg.Peers {
-		voters = append(voters, p.ID)
-	}
-	if !contains(voters, cfg.ID) {
-		voters = append(voters, cfg.ID)
+	voters := cfg.Bootstrap
+	if len(voters) == 0 {
+		voters = make([]raft.NodeID, 0, len(cfg.Peers)+1)
+		for _, p := range cfg.Peers {
+			voters = append(voters, p.ID)
+		}
+		if !contains(voters, cfg.ID) {
+			voters = append(voters, cfg.ID)
+		}
 	}
 
 	rn, err := raft.NewRawNode(raft.Config{
@@ -253,6 +269,7 @@ func Start(cfg Config) (*Node, error) {
 		proposeCh:    make(chan *proposal, cfg.ProposeBuffer),
 		statusCh:     make(chan chan Status),
 		readCh:       make(chan *readRequest, cfg.ProposeBuffer),
+		confCh:       make(chan *confChangeRequest),
 		pending:      make(map[raft.Index]awaiting),
 		pendingReads: make(map[uint64]*readRequest),
 		lastState:    rn.State(),
@@ -331,6 +348,9 @@ func (n *Node) run() {
 
 		case req := <-n.readCh:
 			n.handleRead(req)
+
+		case req := <-n.confCh:
+			n.handleConfChange(req)
 
 		case reply := <-n.statusCh:
 			reply <- n.statusLocked()

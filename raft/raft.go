@@ -156,6 +156,19 @@ type RawNode struct {
 	// snapshot and the log, never configured directly after bootstrap.
 	conf Configuration
 
+	// confIndex is the log index of the entry that established conf, or the
+	// snapshot boundary, or zero for the bootstrap configuration.
+	//
+	// Needed to tell a committed configuration from one that is merely
+	// appended: an uncommitted change can still be truncated by a different
+	// leader, so the cluster must not act as though it were settled.
+	confIndex Index
+
+	// bootstrap is the configuration a node with no durable state starts from.
+	// Kept so the configuration can be recomputed from nothing after the log is
+	// truncated past every change it contained.
+	bootstrap Configuration
+
 	// votes records the responses to the campaign in progress. Read only via
 	// point lookup — never ranged over, because Go randomizes map iteration
 	// order and any ordered decision taken from it would break seed replay.
@@ -217,11 +230,15 @@ func NewRawNode(cfg Config) (*RawNode, error) {
 	// applies only to a node that has never run: once a log exists, it is
 	// authoritative about membership, and preferring a caller-supplied list
 	// would let a stale command-line flag silently rewrite the cluster.
-	switch {
-	case !snap.Config.IsEmpty():
+	r.bootstrap = cfg.Bootstrap.Clone()
+	r.conf = r.bootstrap
+	if !snap.Config.IsEmpty() {
 		r.conf = snap.Config.Clone()
-	default:
-		r.conf = cfg.Bootstrap.Clone()
+		r.confIndex = snap.LastIncludedIndex
+	}
+	// A configuration change in the log supersedes both.
+	if err := r.refreshConfiguration(); err != nil {
+		return nil, err
 	}
 
 	r.becomeFollower(r.term, None)

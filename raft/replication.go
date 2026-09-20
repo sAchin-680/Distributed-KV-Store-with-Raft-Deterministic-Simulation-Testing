@@ -35,12 +35,23 @@ func (r *RawNode) propose(e LogEntry) (Index, error) {
 		return 0, err
 	}
 
+	// A configuration change takes effect on append, so the leader is bound by
+	// the new membership from this moment — including for the very entry that
+	// established it. See refreshConfiguration for why waiting for the commit
+	// cannot work.
+	if e.Type == EntryConfChange {
+		if err := r.refreshConfiguration(); err != nil {
+			return 0, err
+		}
+	}
+
 	// The leader's own log counts toward the quorum, so record it immediately.
 	// In a single-node cluster this is already a majority and the entry commits
 	// without a single message being sent.
-	self := r.progress[r.id]
-	self.Match = e.Index
-	self.Next = e.Index + 1
+	if self, ok := r.progress[r.id]; ok {
+		self.Match = e.Index
+		self.Next = e.Index + 1
+	}
 
 	if _, err := r.maybeAdvanceCommit(); err != nil {
 		return 0, err
@@ -178,6 +189,13 @@ func (r *RawNode) handleAppendRequest(m Message) error {
 			ReadID:        m.ReadID,
 		})
 		return nil
+	}
+
+	// The log changed, so the configuration may have. Recomputed rather than
+	// applied incrementally, because an append can also *remove* a
+	// configuration change by truncating it away.
+	if err := r.refreshConfigurationIfNeeded(m.Entries); err != nil {
+		return err
 	}
 
 	// Persist before the acknowledgement leaves: it is a claim that these
@@ -386,7 +404,41 @@ func (r *RawNode) maybeAdvanceCommit() (bool, error) {
 	}
 
 	r.log.commitTo(candidate)
-	return true, r.persistHardState()
+	if err := r.persistHardState(); err != nil {
+		return false, err
+	}
+
+	// Committing the entry that entered a joint configuration is what allows
+	// leaving it, and leaving is automatic: a cluster must not be able to get
+	// stuck joint because whoever asked for the change went away.
+	if err := r.maybeLeaveJoint(); err != nil {
+		return false, err
+	}
+	r.stepDownIfRemoved()
+	return true, nil
+}
+
+// refreshConfigurationIfNeeded recomputes the configuration when an append
+// could have changed it — either by adding a configuration entry or by
+// truncating one away.
+func (r *RawNode) refreshConfigurationIfNeeded(entries []LogEntry) error {
+	// Three ways an append can change the configuration: it carries one, it
+	// truncated one off the end, or it *overwrote* the entry that held one.
+	//
+	// The third is easy to miss, because replacing an entry leaves the log the
+	// same length — the configuration entry is simply not there any more, and
+	// nothing about the indexes says so.
+	changed := r.confIndex > r.log.lastIndex()
+	for _, e := range entries {
+		if e.Type == EntryConfChange || (r.confIndex > 0 && e.Index <= r.confIndex) {
+			changed = true
+			break
+		}
+	}
+	if !changed {
+		return nil
+	}
+	return r.refreshConfiguration()
 }
 
 // ---------------------------------------------------------------------------
