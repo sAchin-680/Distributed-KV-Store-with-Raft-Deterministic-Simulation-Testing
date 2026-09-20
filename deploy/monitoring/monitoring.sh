@@ -19,7 +19,9 @@ set -euo pipefail
 
 NAMESPACE="${NAMESPACE:-monitoring}"
 RELEASE="${RELEASE:-kv}"
-APP_NAMESPACE="${APP_NAMESPACE:-default}"
+# Which cluster the verify and demo commands act on. Prometheus scrapes every
+# namespace regardless; this only decides what gets counted and broken.
+APP_NAMESPACE="${APP_NAMESPACE:-raftkv-production}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 GRAFANA_PORT="${GRAFANA_PORT:-3000}"
@@ -33,6 +35,37 @@ BREAK_SECONDS="${BREAK_SECONDS:-75}"
 log() { printf '%s  %s\n' "$(date +%H:%M:%S)" "$*"; }
 k() { kubectl --namespace "$NAMESPACE" "$@"; }
 app() { kubectl --namespace "$APP_NAMESPACE" "$@"; }
+
+# Self-heal and this demo want opposite things, and the conflict is real rather
+# than an artefact of the test.
+#
+# ArgoCD puts a hand-scaled cluster back in about a second. The below-quorum
+# alert deliberately waits fifteen, because a leaderless instant is normal. So
+# on a GitOps-managed cluster the drift is gone long before the alert could
+# fire, and the alert could never be exercised while reconciliation runs.
+#
+# Both behaviours are correct, and the alert still has to be tested, because
+# self-heal only repairs drift from the repository. It does nothing about the
+# failures the alert actually exists for — a partition, a lost node, a disk that
+# stopped answering — since the manifests still match and there is no drift to
+# correct. Reconciliation is therefore paused for the demo and restored after.
+ARGOCD_APP=""
+
+pause_gitops() {
+	kubectl -n argocd get application "$APP_NAMESPACE" >/dev/null 2>&1 || return 0
+	ARGOCD_APP="$APP_NAMESPACE"
+	log "pausing ArgoCD self-heal on $ARGOCD_APP for the duration"
+	kubectl -n argocd patch application "$ARGOCD_APP" --type=merge \
+		-p '{"spec":{"syncPolicy":{"automated":null}}}' >/dev/null
+}
+
+resume_gitops() {
+	[[ -n "$ARGOCD_APP" ]] || return 0
+	log "restoring ArgoCD self-heal on $ARGOCD_APP"
+	kubectl -n argocd patch application "$ARGOCD_APP" --type=merge \
+		-p '{"spec":{"syncPolicy":{"automated":{"selfHeal":true,"prune":true}}}}' >/dev/null
+	ARGOCD_APP=""
+}
 
 fullname() { echo "${RELEASE}-raftkv"; }
 
@@ -84,20 +117,21 @@ verify() {
 	log "checking every node is being scraped"
 
 	local expected actual
-	expected=$(app get pods -l "app.kubernetes.io/instance=${RELEASE}" --no-headers | wc -l | tr -d ' ')
-	actual=$(promql 'count(raftkv_up == 1)' | sed -n 's/.*"value":\[[0-9.]*,"\([0-9]*\)"\].*/\1/p')
+	expected=$(app get pods -l "app.kubernetes.io/name=raftkv" --no-headers | wc -l | tr -d ' ')
+	actual=$(promql "count(raftkv_up{namespace=\"${APP_NAMESPACE}\"} == 1)" | sed -n 's/.*"value":\[[0-9.]*,"\([0-9]*\)"\].*/\1/p')
 
 	if [[ "${actual:-0}" != "$expected" ]]; then
 		log "only ${actual:-0} of $expected nodes are reporting; giving it a moment"
 		sleep 15
-		actual=$(promql 'count(raftkv_up == 1)' | sed -n 's/.*"value":\[[0-9.]*,"\([0-9]*\)"\].*/\1/p')
+		actual=$(promql "count(raftkv_up{namespace=\"${APP_NAMESPACE}\"} == 1)" | sed -n 's/.*"value":\[[0-9.]*,"\([0-9]*\)"\].*/\1/p')
 	fi
 
+	printf '  environment:     %s\n' "$APP_NAMESPACE"
 	printf '  nodes scraped:   %s of %s\n' "${actual:-0}" "$expected"
 	printf '  leader:          %s\n' \
-		"$(promql 'raftkv_raft_is_leader == 1' | sed -n 's/.*"node":"\([0-9]*\)".*/node \1/p' | head -1)"
+		"$(promql "raftkv_raft_is_leader{namespace=\"${APP_NAMESPACE}\"} == 1" | sed -n 's/.*"node":"\([0-9]*\)".*/node \1/p' | head -1)"
 	printf '  term:            %s\n' \
-		"$(promql 'max(raftkv_raft_term)' | sed -n 's/.*"value":\[[0-9.]*,"\([0-9]*\)"\].*/\1/p')"
+		"$(promql "max(raftkv_raft_term{namespace=\"${APP_NAMESPACE}\"})" | sed -n 's/.*"value":\[[0-9.]*,"\([0-9]*\)"\].*/\1/p')"
 	printf '  rules loaded:    %s\n' \
 		"$(promql 'count(ALERTS) or vector(0)' | grep -c value || echo 0)"
 
@@ -112,6 +146,10 @@ verify() {
 # routing.
 demo() {
 	local replicas quorum
+	# Restore reconciliation however this exits, including a ctrl-c partway
+	# through, so an interrupted demo never leaves self-heal switched off.
+	trap 'resume_gitops' EXIT INT TERM
+	pause_gitops
 	replicas=$(app get statefulset "$(fullname)" -o jsonpath='{.spec.replicas}')
 	quorum=$((replicas / 2 + 1))
 	log "cluster has $replicas nodes, quorum is $quorum"
@@ -135,6 +173,7 @@ demo() {
 	if [[ -z "$fired" ]]; then
 		log "no alert fired while the cluster was below quorum — the rule is not working"
 		app scale statefulset "$(fullname)" --replicas="$replicas" >/dev/null
+		resume_gitops
 		return 1
 	fi
 
@@ -165,8 +204,10 @@ demo() {
 		log "alerts cleared; the cluster recovered on its own"
 	else
 		log "alerts are still firing after recovery — check the rules"
+		resume_gitops
 		return 1
 	fi
+	resume_gitops
 }
 
 open_ui() {
