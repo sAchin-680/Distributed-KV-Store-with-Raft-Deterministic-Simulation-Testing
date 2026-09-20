@@ -327,6 +327,12 @@ argocd-open: ## Port-forward the ArgoCD UI and print the admin password
 argocd-demo: ## Break the cluster by hand and watch ArgoCD correct it
 	deploy/argocd/argocd.sh demo
 
+# The README's Mermaid blocks are the source of truth and GitHub renders them
+# natively. These PNGs exist only for places that cannot: slides, a CV, a PDF.
+.PHONY: diagrams
+diagrams: ## Render the README's diagrams to docs/images
+	scripts/render-diagrams.sh
+
 ## ---------------------------------------------------------------------------
 ## Infrastructure
 ## ---------------------------------------------------------------------------

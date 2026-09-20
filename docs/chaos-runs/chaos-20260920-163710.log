@@ -1,0 +1,14 @@
+22:07:10  chaos run starting
+22:07:10  adding 60ms ±40ms delay and 3% loss to every node
+22:07:15  partitioning [raftkv-node1 raftkv-node2] from [raftkv-node3 raftkv-node4 raftkv-node5] for 12s
+22:07:28  healing the partition
+22:07:33  killing raftkv-node3 for 10s
+22:07:43  restarting raftkv-node3
+22:07:48  partitioning [raftkv-node5] from [raftkv-node1 raftkv-node2 raftkv-node3 raftkv-node4] for 12s
+22:08:01  healing the partition
+22:08:06  killing raftkv-node4 for 10s
+22:08:06  partitioning [raftkv-node1 raftkv-node2] from [raftkv-node3 raftkv-node4 raftkv-node5] for 12s
+22:08:16  restarting raftkv-node4
+22:08:18  healing the partition
+22:08:24  removing every fault
+22:08:24  chaos run finished
