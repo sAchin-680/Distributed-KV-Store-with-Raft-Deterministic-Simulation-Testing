@@ -195,6 +195,56 @@ check: fmt-check vet determinism lint test mutation ## Everything CI runs on a p
 	@echo "all checks passed"
 
 ## ---------------------------------------------------------------------------
+## Chaos
+## ---------------------------------------------------------------------------
+
+COMPOSE   := docker compose -f deploy/compose/docker-compose.yml
+CHAOS_DIR ?= docs/chaos-runs
+CHAOS_RUN ?= $(shell date -u +%Y%m%d-%H%M%S)
+
+.PHONY: chaos-image
+chaos-image: ## Build the container image with the network-fault tools
+	docker build --target chaos -t $(IMAGE):chaos .
+
+.PHONY: chaos-up
+chaos-up: chaos-image ## Start a five-node cluster in containers
+	$(COMPOSE) up -d
+	@echo "waiting for a leader..."
+	@sleep 12
+	@$(MAKE) --no-print-directory chaos-status
+
+.PHONY: chaos-down
+chaos-down: ## Stop the cluster and delete its data
+	$(COMPOSE) down -v
+
+.PHONY: chaos-status
+chaos-status: $(BIN)/kvctl ## Show what every node believes
+	@$(BIN)/kvctl --endpoints=$(CHAOS_ENDPOINTS) status
+
+CHAOS_ENDPOINTS := 127.0.0.1:18001,127.0.0.1:18002,127.0.0.1:18003,127.0.0.1:18004,127.0.0.1:18005
+
+# Faults and workload have to run together: a workload against a healthy
+# cluster only demonstrates that it works when nothing is wrong, which is not
+# in question.
+.PHONY: chaos-run
+chaos-run: $(BIN)/chaosctl ## Drive a workload under network chaos and check the history
+	@mkdir -p $(CHAOS_DIR)
+	@deploy/chaos/chaos.sh run > $(CHAOS_DIR)/chaos-$(CHAOS_RUN).log 2>&1 & \
+	sleep 2; \
+	$(BIN)/chaosctl --endpoints=$(CHAOS_ENDPOINTS) --duration=75s \
+		--clients=10 --keys=4 --key-prefix=$(CHAOS_RUN) --out=$(CHAOS_DIR); \
+	status=$$?; wait; exit $$status
+
+.PHONY: chaos-check
+chaos-check: $(BIN)/chaosctl ## Re-decide a saved history (HISTORY=path [CHECK_TIMEOUT=10m])
+	@[ -n "$(HISTORY)" ] || { echo "usage: make chaos-check HISTORY=docs/chaos-runs/history-....json"; exit 2; }
+	$(BIN)/chaosctl --check=$(HISTORY) --check-timeout=$(or $(CHECK_TIMEOUT),10m)
+
+.PHONY: chaos-heal
+chaos-heal: ## Remove every injected fault
+	deploy/chaos/chaos.sh heal
+
+## ---------------------------------------------------------------------------
 ## Container
 ## ---------------------------------------------------------------------------
 
