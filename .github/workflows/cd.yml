@@ -130,6 +130,11 @@ jobs:
           context: .
           target: runtime
           push: true
+          # Both architectures, because an amd64-only image cannot run on an
+          # arm64 node and the push succeeds regardless — the failure surfaces
+          # later, as a pod that cannot start, long after CI reported green.
+          # The Dockerfile cross-compiles, so this is nearly free.
+          platforms: linux/amd64,linux/arm64
           tags: |
             ${{ env.REGISTRY }}/${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
           build-args: |
