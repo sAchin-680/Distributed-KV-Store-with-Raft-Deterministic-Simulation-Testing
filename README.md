@@ -359,6 +359,40 @@ the cluster is not running it, and reverting would not roll back. Gating the
 commit keeps git true, so a rollback stays a revert.
 [.github/workflows/cd.yml](.github/workflows/cd.yml) is the pipeline.
 
+### The platform is Terraform, and the state lock is real
+
+Four layers — the cluster, the platform, and one per environment — each with its
+own state, so applying staging cannot reach production or the control plane.
+
+```bash
+make tf-bootstrap    # the cluster, and the backend everything else uses
+make tf-platform     # ArgoCD and the monitoring stack
+make tf-staging      # what staging runs
+make tf-lock-demo    # show the lock refusing concurrent operations
+```
+
+State lives in the cluster: a Secret holds it, a `Lease` guards it. That is
+genuine distributed locking rather than a file that happens to be present, and
+it is demonstrated rather than claimed — four concurrent plans, one runs:
+
+```
+  plan 1  acquired the lock and ran
+  plan 2  refused by the lock
+  plan 3  refused by the lock
+  plan 4  refused by the lock
+```
+
+The backend lives *inside* the cluster it tracks, so the cluster itself cannot
+be tracked in it — `bootstrap/` uses local state for exactly that reason. Every
+setup has this ordering problem and most hide it behind an S3 bucket somebody
+created by hand years ago; here it is explicit, and the layer with local state
+is disposable.
+
+No cloud account is involved, deliberately. An EKS module that was written but
+never applied would be the only thing in this repository without a measured
+result behind it. [terraform/](terraform/) has the rest, including three things
+it taught by failing.
+
 ## Measured
 
 Core-only numbers — no disk, no network, no goroutines. They say how much
@@ -555,7 +589,8 @@ Built in milestones, each with an explicit exit criterion rather than a vibe.
 | done | Prometheus rules, Alertmanager, Grafana dashboard, alerts fired on purpose |
 | done | GitOps with ArgoCD, drift broken on purpose and corrected in two seconds |
 | done | Staging and production environments, deployment gated on the fuzz suite |
-| next | The fuzz write-up, and Terraform |
+| done | Terraform for the whole platform, with remote state and a demonstrated lock |
+| next | The standalone write-up on what the simulator catches |
 
 ## Documentation
 
@@ -568,6 +603,7 @@ Built in milestones, each with an explicit exit criterion rather than a vibe.
 - [Rolling upgrade](docs/rollout/) — replacing every node under load, and the sixteen operations it cost
 - [Monitoring](deploy/monitoring/) — what to alert on in a consensus cluster, and why pod health is the wrong signal
 - [GitOps](deploy/argocd/) — drift broken on purpose, and why no alert firing was the correct outcome
+- [Infrastructure](terraform/) — four layers, remote state with a demonstrated lock, and why the bootstrap layer is different
 
 ## References
 

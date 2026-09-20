@@ -328,6 +328,62 @@ argocd-demo: ## Break the cluster by hand and watch ArgoCD correct it
 	deploy/argocd/argocd.sh demo
 
 ## ---------------------------------------------------------------------------
+## Infrastructure
+## ---------------------------------------------------------------------------
+
+TF      := terraform
+TF_DIR  := terraform
+
+# The cluster, and the backend every other layer stores state in. Local state,
+# because the backend it creates does not exist yet — see terraform/README.md.
+.PHONY: tf-bootstrap
+tf-bootstrap: ## Create the cluster and the state backend
+	$(TF) -chdir=$(TF_DIR)/bootstrap init
+	$(TF) -chdir=$(TF_DIR)/bootstrap apply
+
+.PHONY: tf-platform
+tf-platform: ## Install ArgoCD and the monitoring stack, tracked in remote state
+	$(TF) -chdir=$(TF_DIR)/platform init
+	$(TF) -chdir=$(TF_DIR)/platform apply
+
+.PHONY: tf-staging
+tf-staging: ## Declare what staging runs
+	$(TF) -chdir=$(TF_DIR)/environments/staging init
+	$(TF) -chdir=$(TF_DIR)/environments/staging apply
+
+.PHONY: tf-production
+tf-production: ## Declare what production runs
+	$(TF) -chdir=$(TF_DIR)/environments/production init
+	$(TF) -chdir=$(TF_DIR)/environments/production apply
+
+# "Remote state with locking" is a line in a backend block until something has
+# actually been refused. This starts four plans at once and shows three of them
+# turned away.
+.PHONY: tf-lock-demo
+tf-lock-demo: ## Show the state lock refusing concurrent operations
+	$(TF_DIR)/lock-demo.sh
+
+.PHONY: tf-validate
+tf-validate: ## Check every layer and module
+	@for d in $(TF_DIR)/modules/* $(TF_DIR)/bootstrap $(TF_DIR)/platform \
+	          $(TF_DIR)/environments/staging $(TF_DIR)/environments/production; do \
+		$(TF) -chdir=$$d init -backend=false >/dev/null 2>&1 || true; \
+		printf '  %-42s ' "$$d"; \
+		$(TF) -chdir=$$d validate >/dev/null 2>&1 && echo valid || echo INVALID; \
+	done
+
+.PHONY: tf-fmt-check
+tf-fmt-check: ## Report any unformatted Terraform
+	$(TF) fmt -check -recursive $(TF_DIR)
+
+.PHONY: tf-destroy
+tf-destroy: ## Remove everything, in dependency order
+	-$(TF) -chdir=$(TF_DIR)/environments/production destroy
+	-$(TF) -chdir=$(TF_DIR)/environments/staging destroy
+	-$(TF) -chdir=$(TF_DIR)/platform destroy
+	-$(TF) -chdir=$(TF_DIR)/bootstrap destroy
+
+## ---------------------------------------------------------------------------
 ## Container
 ## ---------------------------------------------------------------------------
 
