@@ -1,0 +1,135 @@
+# A five-node cluster, one process per container, on a network the chaos script
+# can damage.
+#
+# Five rather than three because five tolerates two failures, which leaves room
+# to partition the cluster and still have a working majority on one side. A
+# three-node cluster under a partition usually just stalls, and a stalled
+# cluster satisfies every safety property trivially.
+
+name: raftkv-chaos
+
+x-node: &node
+  image: raftkv:chaos
+  networks: [raft]
+  # tc and iptables reconfigure the container's own network stack, which needs
+  # this. It is also why the chaos image is not the one that would be deployed.
+  cap_add: [NET_ADMIN]
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD", "/usr/local/bin/kvctl", "--endpoints=127.0.0.1:8001", "--timeout=2s", "status"]
+    interval: 5s
+    timeout: 3s
+    retries: 30
+    start_period: 5s
+
+services:
+  node1:
+    <<: *node
+    container_name: raftkv-node1
+    # Peers are addressed by container name, which docker resolves. The IDs are
+    # what consensus uses and never change; the names are how those IDs happen
+    # to be reachable right now.
+    command:
+      - --id=1
+      - --peers=1@node1:9001,2@node2:9001,3@node3:9001,4@node4:9001,5@node5:9001
+      - --listen=0.0.0.0:9001
+      - --client-listen=0.0.0.0:8001
+      - --data=/data
+      # 50ms ticks give a 500ms-1s election timeout: long enough that the
+      # injected latency below does not cause elections by itself, short enough
+      # that a partition heals well within a run.
+      - --tick=50ms
+      - --log-level=info
+    ports: ["18001:8001"]
+    volumes: [node1-data:/data]
+
+  node2:
+    <<: *node
+    container_name: raftkv-node2
+    # Peers are addressed by container name, which docker resolves. The IDs are
+    # what consensus uses and never change; the names are how those IDs happen
+    # to be reachable right now.
+    command:
+      - --id=2
+      - --peers=1@node1:9001,2@node2:9001,3@node3:9001,4@node4:9001,5@node5:9001
+      - --listen=0.0.0.0:9001
+      - --client-listen=0.0.0.0:8001
+      - --data=/data
+      # 50ms ticks give a 500ms-1s election timeout: long enough that the
+      # injected latency below does not cause elections by itself, short enough
+      # that a partition heals well within a run.
+      - --tick=50ms
+      - --log-level=info
+    ports: ["18002:8001"]
+    volumes: [node2-data:/data]
+
+  node3:
+    <<: *node
+    container_name: raftkv-node3
+    # Peers are addressed by container name, which docker resolves. The IDs are
+    # what consensus uses and never change; the names are how those IDs happen
+    # to be reachable right now.
+    command:
+      - --id=3
+      - --peers=1@node1:9001,2@node2:9001,3@node3:9001,4@node4:9001,5@node5:9001
+      - --listen=0.0.0.0:9001
+      - --client-listen=0.0.0.0:8001
+      - --data=/data
+      # 50ms ticks give a 500ms-1s election timeout: long enough that the
+      # injected latency below does not cause elections by itself, short enough
+      # that a partition heals well within a run.
+      - --tick=50ms
+      - --log-level=info
+    ports: ["18003:8001"]
+    volumes: [node3-data:/data]
+
+  node4:
+    <<: *node
+    container_name: raftkv-node4
+    # Peers are addressed by container name, which docker resolves. The IDs are
+    # what consensus uses and never change; the names are how those IDs happen
+    # to be reachable right now.
+    command:
+      - --id=4
+      - --peers=1@node1:9001,2@node2:9001,3@node3:9001,4@node4:9001,5@node5:9001
+      - --listen=0.0.0.0:9001
+      - --client-listen=0.0.0.0:8001
+      - --data=/data
+      # 50ms ticks give a 500ms-1s election timeout: long enough that the
+      # injected latency below does not cause elections by itself, short enough
+      # that a partition heals well within a run.
+      - --tick=50ms
+      - --log-level=info
+    ports: ["18004:8001"]
+    volumes: [node4-data:/data]
+
+  node5:
+    <<: *node
+    container_name: raftkv-node5
+    # Peers are addressed by container name, which docker resolves. The IDs are
+    # what consensus uses and never change; the names are how those IDs happen
+    # to be reachable right now.
+    command:
+      - --id=5
+      - --peers=1@node1:9001,2@node2:9001,3@node3:9001,4@node4:9001,5@node5:9001
+      - --listen=0.0.0.0:9001
+      - --client-listen=0.0.0.0:8001
+      - --data=/data
+      # 50ms ticks give a 500ms-1s election timeout: long enough that the
+      # injected latency below does not cause elections by itself, short enough
+      # that a partition heals well within a run.
+      - --tick=50ms
+      - --log-level=info
+    ports: ["18005:8001"]
+    volumes: [node5-data:/data]
+
+networks:
+  raft:
+    name: raftkv-chaos
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+  node4-data:
+  node5-data:
