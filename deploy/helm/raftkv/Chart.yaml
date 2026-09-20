@@ -1,0 +1,8 @@
+apiVersion: v2
+name: raftkv
+description: A replicated key/value store on hand-written Raft
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/sAchin-680/Distributed-KV-Store-with-Raft-Deterministic-Simulation-Testing
+keywords: [raft, consensus, key-value, distributed]

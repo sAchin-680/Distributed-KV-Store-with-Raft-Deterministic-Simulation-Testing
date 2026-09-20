@@ -1,0 +1,46 @@
+# The headless service is what makes the StatefulSet's DNS names resolve.
+#
+# clusterIP: None means no load balancing and no virtual IP: a lookup returns
+# the pods' own addresses, and each pod gets its own name. That is exactly what
+# consensus needs, because a peer must be addressed individually — sending an
+# AppendEntries to "whichever node answers" is meaningless.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "raftkv.headless" . }}
+  labels:
+    {{- include "raftkv.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  # Peers must resolve before a pod is Ready, and a pod is not Ready until the
+  # cluster has a leader, which cannot happen until peers resolve. Without this
+  # the cluster cannot bootstrap at all.
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "raftkv.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: peer
+      port: {{ .Values.ports.peer }}
+      targetPort: peer
+    - name: metrics
+      port: {{ .Values.ports.metrics }}
+      targetPort: metrics
+---
+# Clients get an ordinary load-balanced service. They do not care which node
+# answers: a write to a follower is refused with a hint naming the leader, and
+# the client library follows it. Leadership moves on its own schedule, so
+# pinning clients to one pod would break on an ordinary election.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "raftkv.fullname" . }}
+  labels:
+    {{- include "raftkv.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "raftkv.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: client
+      port: {{ .Values.ports.client }}
+      targetPort: client

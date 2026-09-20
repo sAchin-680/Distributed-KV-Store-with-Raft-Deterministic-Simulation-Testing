@@ -319,13 +319,29 @@ MUTATIONS: list[Mutation] = [
 
 def run_tests(pattern: str, pkg: str = "./raft/") -> bool:
     """Return True if the test run passed."""
+    return run_tests_reporting(pattern, pkg)[0]
+
+
+def run_tests_reporting(pattern: str, pkg: str = "./raft/") -> tuple[bool, str]:
+    """Run the tests and return whether they passed, plus what they printed.
+
+    The output matters when the *baseline* fails. A bare "the suite is red"
+    leaves the reader to reproduce it themselves, and the suite here is long
+    enough that an intermittent failure can easily be green by the time they do
+    — at which point the only evidence of what broke has been thrown away.
+    """
     result = subprocess.run(
         ["go", "test", pkg, "-count=1", "-run", pattern],
         cwd=ROOT,
         capture_output=True,
         text=True,
     )
-    return result.returncode == 0
+    return result.returncode == 0, result.stdout + result.stderr
+
+
+def failing_packages(output: str) -> list[str]:
+    """Pull just the failures out of a `go test ./...` run."""
+    return [line for line in output.splitlines() if line.startswith(("FAIL", "---", "panic:"))]
 
 
 def main() -> int:
@@ -348,8 +364,11 @@ def main() -> int:
     selected.sort(key=lambda m: m.name)
 
     # Confirm the suite is green first, or every result below is meaningless.
-    if not run_tests(".", "./..."):
+    passed, output = run_tests_reporting(".", "./...")
+    if not passed:
         print(f"{RED}the test suite fails before any mutation; fix that first{RESET}")
+        for line in failing_packages(output) or output.splitlines()[-20:]:
+            print(f"  {line}")
         return 2
 
     # A pattern that matches no test makes `go test` exit 0, which would report

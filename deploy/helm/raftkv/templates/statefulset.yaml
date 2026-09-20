@@ -1,0 +1,172 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "raftkv.fullname" . }}
+  labels:
+    {{- include "raftkv.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "raftkv.headless" . }}
+  replicas: {{ .Values.replicaCount }}
+
+  # Parallel, and this is required rather than preferred.
+  #
+  # The default, OrderedReady, starts pod-0 and waits for it to become Ready
+  # before starting pod-1. This node is Ready only when the cluster has a
+  # leader, and one pod cannot elect a leader in a five-node configuration
+  # because it is not a majority. The cluster would never start.
+  #
+  # Rolling *updates* are still one pod at a time regardless of this setting,
+  # which is what actually matters for keeping quorum during an upgrade.
+  podManagementPolicy: {{ .Values.podManagementPolicy }}
+
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Replace pods in descending ordinal order, one at a time, each waiting to
+      # become Ready before the next is touched. With readiness meaning "the
+      # cluster has a leader", a rollout cannot proceed past a node that has not
+      # rejoined — so it stalls rather than taking the cluster below quorum.
+      partition: 0
+
+  selector:
+    matchLabels:
+      {{- include "raftkv.selectorLabels" . | nindent 6 }}
+
+  template:
+    metadata:
+      labels:
+        {{- include "raftkv.labels" . | nindent 8 }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.ports.metrics | quote }}
+        prometheus.io/path: /metrics
+    spec:
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if eq .Values.antiAffinity "soft" }}
+      affinity:
+        podAntiAffinity:
+          # Spread across machines so losing one does not take a majority with
+          # it. Preferred rather than required, so a single-node test cluster
+          # can still schedule all five.
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "raftkv.selectorLabels" . | nindent 20 }}
+      {{- else if eq .Values.antiAffinity "hard" }}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  {{- include "raftkv.selectorLabels" . | nindent 18 }}
+      {{- end }}
+
+      containers:
+        - name: raftd
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+
+          # The node id comes from the pod's ordinal, which a StatefulSet
+          # guarantees is stable across restarts and reschedules. Plus one,
+          # because zero means "no node" in the protocol.
+          command: [/bin/sh, -c]
+          args:
+            - |
+              set -eu
+              ORDINAL="${HOSTNAME##*-}"
+              exec /usr/local/bin/raftd \
+                --id="$((ORDINAL + 1))" \
+                --peers={{ include "raftkv.peers" . | quote }} \
+                --listen=0.0.0.0:{{ .Values.ports.peer }} \
+                --client-listen=0.0.0.0:{{ .Values.ports.client }} \
+                --metrics-listen=0.0.0.0:{{ .Values.ports.metrics }} \
+                --data=/data \
+                --tick={{ .Values.raft.tick }} \
+                --election-ticks={{ .Values.raft.electionTicks }} \
+                --heartbeat-ticks={{ .Values.raft.heartbeatTicks }} \
+                --pre-vote={{ .Values.raft.preVote }} \
+                --log-level={{ .Values.raft.logLevel }} \
+                {{- range .Values.extraArgs }}
+                {{ . }} \
+                {{- end }}
+
+          ports:
+            - {name: peer, containerPort: {{ .Values.ports.peer }}}
+            - {name: client, containerPort: {{ .Values.ports.client }}}
+            - {name: metrics, containerPort: {{ .Values.ports.metrics }}}
+
+          # Readiness means "part of a working cluster", so a node that cannot
+          # see a leader is taken out of the client service rather than serving
+          # errors — and a rolling update will not move past it.
+          readinessProbe:
+            httpGet: {path: /readyz, port: metrics}
+            initialDelaySeconds: 3
+            periodSeconds: 3
+            failureThreshold: 3
+
+          # Liveness is deliberately weaker: it only asks whether the process is
+          # answering. Restarting a node because the cluster has no leader would
+          # remove a voter needed to elect one, turning a recoverable outage into
+          # a longer one.
+          livenessProbe:
+            httpGet: {path: /livez, port: metrics}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 6
+
+          # A new pod has an empty log and must be caught up by the leader, which
+          # can take a snapshot transfer. Starting the readiness clock too early
+          # would fail it for being slow rather than broken.
+          startupProbe:
+            httpGet: {path: /livez, port: metrics}
+            periodSeconds: 2
+            failureThreshold: 30
+
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+
+          volumeMounts:
+            - name: data
+              mountPath: /data
+
+      {{- if not .Values.persistence.enabled }}
+      volumes:
+        - name: data
+          emptyDir: {}
+      {{- end }}
+
+  {{- if .Values.persistence.enabled }}
+  # Each pod keeps its own volume across restarts and reschedules. That is the
+  # other half of why this is a StatefulSet: a node's identity is its log, and a
+  # node that comes back with someone else's disk — or with none — has lost the
+  # vote and entries its cluster was counting on.
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: {{- toYaml .Values.persistence.accessModes | nindent 10 }}
+        {{- with .Values.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}
+  {{- end }}

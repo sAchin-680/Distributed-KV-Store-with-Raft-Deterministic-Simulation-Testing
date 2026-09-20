@@ -245,6 +245,50 @@ chaos-heal: ## Remove every injected fault
 	deploy/chaos/chaos.sh heal
 
 ## ---------------------------------------------------------------------------
+## Kubernetes
+## ---------------------------------------------------------------------------
+
+KIND_CLUSTER ?= raftkv
+RELEASE      ?= kv
+CHART        := deploy/helm/raftkv
+
+.PHONY: kind-up
+kind-up: ## Create the local Kubernetes cluster
+	kind create cluster --name $(KIND_CLUSTER) --config deploy/kind.yaml
+
+.PHONY: kind-down
+kind-down: ## Delete the local Kubernetes cluster
+	kind delete cluster --name $(KIND_CLUSTER)
+
+# The image is loaded into the nodes rather than pulled. kind has no registry,
+# so an image that only exists on the host is invisible to the kubelet.
+.PHONY: kind-load
+kind-load: docker ## Build the image and load it into the kind nodes
+	kind load docker-image $(IMAGE):latest --name $(KIND_CLUSTER)
+
+.PHONY: helm-lint
+helm-lint: ## Check the chart renders and is well formed
+	helm lint $(CHART)
+	helm template $(RELEASE) $(CHART) > /dev/null
+
+.PHONY: deploy
+deploy: kind-load ## Install or upgrade the cluster on Kubernetes
+	helm upgrade --install $(RELEASE) $(CHART) \
+		--set image.tag=latest --wait --timeout=5m
+	kubectl rollout status statefulset/$(RELEASE)-raftkv --timeout=5m
+
+.PHONY: undeploy
+undeploy: ## Remove the release and its volumes
+	helm uninstall $(RELEASE) || true
+	kubectl delete pvc -l app.kubernetes.io/instance=$(RELEASE) --ignore-not-found
+
+# Replaces every node while clients are writing, and reports what they saw.
+# The claim is that a rolling upgrade never costs quorum; this is the evidence.
+.PHONY: rollout
+rollout: ## Roll every pod under load and check the history is linearizable
+	RELEASE=$(RELEASE) deploy/rollout.sh run
+
+## ---------------------------------------------------------------------------
 ## Container
 ## ---------------------------------------------------------------------------
 

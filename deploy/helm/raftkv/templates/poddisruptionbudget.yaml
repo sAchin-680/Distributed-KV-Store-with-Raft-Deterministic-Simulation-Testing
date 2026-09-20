@@ -1,0 +1,22 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+# Without this, a node drain will evict as many pods as it likes at once.
+#
+# Kubernetes has no idea that three of these five pods constitute a majority.
+# Draining a machine that happens to host three of them takes the cluster below
+# quorum, and it stops committing until they come back — an outage caused
+# entirely by routine maintenance.
+#
+# minAvailable is the quorum, so at most the tolerable number can ever be
+# unavailable voluntarily.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "raftkv.fullname" . }}
+  labels:
+    {{- include "raftkv.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ include "raftkv.quorum" . }}
+  selector:
+    matchLabels:
+      {{- include "raftkv.selectorLabels" . | nindent 6 }}
+{{- end }}

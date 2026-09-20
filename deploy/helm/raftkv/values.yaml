@@ -1,0 +1,80 @@
+# Replica count.
+#
+# Odd, always. Four nodes tolerate exactly one failure, the same as three, while
+# needing one more vote to agree — strictly worse. Five tolerates two.
+#
+# Changing this on an existing cluster is not a membership change. Kubernetes
+# will add or remove pods, but the Raft configuration lives in the replicated
+# log and only moves through joint consensus. Scale the StatefulSet first so the
+# new pod exists and is reachable, then run `kvctl members` to make it count.
+replicaCount: 5
+
+image:
+  repository: raftkv
+  tag: ""          # defaults to the chart's appVersion
+  pullPolicy: IfNotPresent
+
+# Ports. Peer, client and metrics traffic are separated so that a flood of
+# client requests cannot starve the heartbeats keeping the leader in office, and
+# so scraping still works when the client API is overloaded.
+ports:
+  peer: 9001
+  client: 8001
+  metrics: 7001
+
+raft:
+  # Real time per logical tick. The election timeout is tick x electionTicks,
+  # randomised up to double that, so this is 1–2s: long enough to ride out a
+  # normal GC pause or a slow node, short enough that failover is quick.
+  tick: 100ms
+  electionTicks: 10
+  heartbeatTicks: 2
+  preVote: true
+  logLevel: info
+
+persistence:
+  enabled: true
+  size: 8Gi
+  storageClass: ""     # empty uses the cluster default
+  accessModes: [ReadWriteOnce]
+
+# Set from measurements, not guesses. An fsync costs about 8ms and dominates
+# everything the algorithm does, so these nodes are bound by disk rather than
+# CPU; the request is small and the limit exists to stop one node starving its
+# neighbours rather than to describe expected use.
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+
+# A budget of quorum-1 is the whole point of running this on Kubernetes at all.
+#
+# It stops a node drain, an upgrade and a rolling restart from together taking
+# the cluster below a majority. Without it, Kubernetes will happily evict three
+# of five pods at once to drain a node, and the cluster stops committing.
+podDisruptionBudget:
+  enabled: true
+
+# Pods are started in parallel rather than one at a time, and this is required
+# rather than a preference. See the comment in statefulset.yaml.
+podManagementPolicy: Parallel
+
+# Spread pods across nodes so one machine failing does not take a majority with
+# it. Soft rather than required, so a smaller cluster can still schedule.
+antiAffinity: soft
+
+serviceMonitor:
+  enabled: false       # needs the Prometheus operator
+  interval: 15s
+
+terminationGracePeriodSeconds: 30
+
+nameOverride: ""
+fullnameOverride: ""
+
+nodeSelector: {}
+tolerations: []
+extraArgs: []
