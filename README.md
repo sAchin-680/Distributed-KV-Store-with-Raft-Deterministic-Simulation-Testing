@@ -104,21 +104,36 @@ having applied a different command at the same position.
 
 ### One integer reproduces any failure
 
-That is the whole point of building it this way. Three runs of the same seed:
+That is the whole point of building it this way.
 
 ```
-284481 events, 12633ms virtual, trace 39e3e8aef5e8191d
-284481 events, 12633ms virtual, trace 39e3e8aef5e8191d
-284481 events, 12633ms virtual, trace 39e3e8aef5e8191d
-
-safety violation [committed-entries-never-change] at t=12633ms (seed 2):
-  committed index 157 changed: node 4 committed term 1 (bca6269a) at t=3255ms,
-  node 1 now has term 2 (da3a08fa)
+$ for i in 1 2 3; do simctl run --seed=2; done
+169359 events in 72.578ms (30000ms virtual), 1146 entries committed across
+  7 leader terms, 15 crashes, 14 restarts, 10 partitions, 102 snapshots taken,
+  41 sent, 4 membership changes, 77639 msgs (3523 dropped, 1482 duplicated),
+  trace 26c664211d16bfc0
+169359 events in 71.143ms ... trace 26c664211d16bfc0
+169359 events in 72.652ms ... trace 26c664211d16bfc0
 ```
 
-Identical event count, identical trace hash, identical violation at the same
-index and the same millisecond — on any machine, indefinitely. A randomized test
-that cannot do this reports failures nobody can act on.
+Identical event count and identical trace hash on every run. The wall-clock time
+differs because that is the only thing not simulated.
+
+A failure is pinned the same way. Seeds that once failed now pass, so the
+demonstration uses the negative control — durability deliberately broken, which
+*must* produce violations:
+
+```
+$ for i in 1 2 3; do simctl run --seed=27 --disk-loss=0.5; done
+safety violation [committed-entries-never-change] at t=26106ms (seed 27):
+  committed index 119 changed: node 1 committed term 1 (8488d043) at t=2520ms,
+  node 3 now has term 3 (c38200e5)
+```
+
+The same violation, at the same index, at the same millisecond, every time — on
+any machine, indefinitely. Add a print statement and it reappears with the print
+statement in it. A randomized test that cannot do this reports failures nobody
+can act on.
 
 ### Bugs it found
 
@@ -598,6 +613,7 @@ Built in milestones, each with an explicit exit criterion rather than a vibe.
 - [ADR-0001](docs/adr/0001-pure-deterministic-core.md) — why the consensus core has no clock, I/O or goroutines
 - [ADR-0002](docs/adr/0002-synchronous-persistence.md) — what fsync costs, measured, and the ceiling it sets
 - [ADR-0003](docs/adr/0003-read-index.md) — why the obvious read is wrong, and why not a leader lease
+- [What the simulator catches](docs/what-the-simulator-catches.md) — why ordinary testing is insufficient for consensus, and what the four real bugs looked like
 - [ADR-0004](docs/adr/0004-statefulset-not-deployment.md) — what a Deployment breaks, and the two settings that are required rather than preferred
 - [Chaos runs](docs/chaos-runs/) — histories recorded under real network faults, including the run that stayed undecided
 - [Rolling upgrade](docs/rollout/) — replacing every node under load, and the sixteen operations it cost
