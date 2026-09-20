@@ -253,6 +253,43 @@ The workload runs *inside* the cluster. A port-forward dies with its target pod,
 and the resulting errors would be the harness failing rather than the store.
 Full account in [docs/rollout/](docs/rollout/).
 
+### The alerts were fired on purpose
+
+Prometheus scrapes every node individually, Alertmanager routes the result, and
+Grafana renders a dashboard provisioned from a file in this repository.
+
+```bash
+make monitoring-up     # install alongside a running cluster
+make monitoring-open   # Grafana :3000, Prometheus :9090, Alertmanager :9093
+make monitoring-demo   # break quorum, watch the alert fire, heal, watch it clear
+```
+
+An alert rule that has never fired is an assertion, not a safeguard — the
+expression may not match the metric names, the threshold may be unreachable, the
+routing may drop it, and none of that surfaces until an incident. So the demo
+takes quorum away and checks the alert arrives:
+
+```
+cluster has 5 nodes, quorum is 3
+scaling down to 2 — one short of a majority
+alerts firing: RaftKVBelowQuorum RaftKVNoLeader      (30s after quorum was lost)
+healing: scaling back to 5
+alerts cleared; the cluster recovered on its own     (10s after recovery)
+```
+
+`RaftKVNoLeader` is expressed as *no node can name a leader*, not as a count of
+running pods, because those are different questions: five pods can be `Running`
+and healthy while a partition leaves none of them able to reach a majority.
+Kubernetes cannot see that difference. It waits 15s — about ten election
+timeouts — because a leaderless instant is normal and an alert that fires on
+every routine failover trains people to ignore it.
+
+Scaling the StatefulSet down does not remove anything from the Raft
+configuration; membership lives in the replicated log. The cluster still
+believed it had five voters, so two survivors correctly refused to serve. The
+alert measures a majority of the *configuration*, not a count of pods.
+[deploy/monitoring/](deploy/monitoring/) has the rest.
+
 ## Measured
 
 Core-only numbers — no disk, no network, no goroutines. They say how much
@@ -446,6 +483,7 @@ Built in milestones, each with an explicit exit criterion rather than a vibe.
 | done | Randomized testing at scale, with bugs found and documented |
 | done | Prometheus metrics, health endpoints, Helm chart, Kubernetes deployment |
 | done | Rolling upgrade under load, measured against a live cluster |
+| done | Prometheus rules, Alertmanager, Grafana dashboard, alerts fired on purpose |
 | next | Terraform, ArgoCD, and the continuous-deployment correctness gate |
 
 ## Documentation
@@ -457,6 +495,7 @@ Built in milestones, each with an explicit exit criterion rather than a vibe.
 - [ADR-0004](docs/adr/0004-statefulset-not-deployment.md) — what a Deployment breaks, and the two settings that are required rather than preferred
 - [Chaos runs](docs/chaos-runs/) — histories recorded under real network faults, including the run that stayed undecided
 - [Rolling upgrade](docs/rollout/) — replacing every node under load, and the sixteen operations it cost
+- [Monitoring](deploy/monitoring/) — what to alert on in a consensus cluster, and why pod health is the wrong signal
 
 ## References
 

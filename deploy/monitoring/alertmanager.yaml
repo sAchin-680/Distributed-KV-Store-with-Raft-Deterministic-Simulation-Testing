@@ -1,0 +1,86 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-config
+  namespace: monitoring
+data:
+  alertmanager.yml: |
+    route:
+      receiver: default
+      # Alerts are grouped by name and cluster rather than by pod. During a
+      # rolling upgrade every pod in turn goes down, and per-pod grouping would
+      # send five separate notifications for one expected event.
+      group_by: [alertname, namespace]
+      group_wait: 10s
+      group_interval: 1m
+      repeat_interval: 1h
+
+      routes:
+        # A cluster that cannot commit is the one thing worth waking someone
+        # for, so it skips the grouping delay and repeats until it clears.
+        - matchers: [severity="critical"]
+          receiver: critical
+          group_wait: 0s
+          repeat_interval: 5m
+
+    # Losing quorum implies the individual nodes are down, so the node-level
+    # warning adds nothing once the cluster-level alert has fired.
+    inhibit_rules:
+      - source_matchers: [alertname="RaftKVBelowQuorum"]
+        target_matchers: [alertname="RaftKVNodeDown"]
+        equal: [namespace]
+      - source_matchers: [alertname="RaftKVNoLeader"]
+        target_matchers: [alertname="RaftKVLeaderFlapping"]
+        equal: [namespace]
+
+    # Receivers are deliberately empty here. Wiring a real destination means
+    # putting a credential in the cluster, which belongs in a Secret managed
+    # outside this repository rather than in a file under version control.
+    # Alerts are still visible in the Alertmanager UI and the API, which is what
+    # the demo checks.
+    receivers:
+      - name: default
+      - name: critical
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alertmanager
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: alertmanager}
+  template:
+    metadata:
+      labels: {app: alertmanager}
+    spec:
+      containers:
+        - name: alertmanager
+          image: prom/alertmanager:v0.27.0
+          args:
+            - --config.file=/etc/alertmanager/alertmanager.yml
+            - --storage.path=/alertmanager
+          ports:
+            - {name: web, containerPort: 9093}
+          volumeMounts:
+            - {name: config, mountPath: /etc/alertmanager}
+            - {name: data, mountPath: /alertmanager}
+          readinessProbe:
+            httpGet: {path: /-/ready, port: web}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 256Mi}
+      volumes:
+        - {name: config, configMap: {name: alertmanager-config}}
+        - {name: data, emptyDir: {}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alertmanager
+  namespace: monitoring
+spec:
+  selector: {app: alertmanager}
+  ports:
+    - {name: web, port: 9093, targetPort: web}

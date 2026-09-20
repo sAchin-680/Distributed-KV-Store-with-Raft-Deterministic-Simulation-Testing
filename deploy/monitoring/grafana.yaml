@@ -1,0 +1,96 @@
+# Grafana, with its datasource and dashboard provisioned from files.
+#
+# Provisioned rather than clicked together in the UI. A dashboard that only
+# exists in Grafana's database is lost when the pod is replaced and cannot be
+# reviewed in a pull request; this one is a file in the repository that happens
+# to be mounted into a container.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-provisioning
+  namespace: monitoring
+data:
+  datasources.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        uid: prometheus
+        access: proxy
+        url: http://prometheus:9090
+        isDefault: true
+        jsonData:
+          timeInterval: 5s
+
+  dashboards.yaml: |
+    apiVersion: 1
+    providers:
+      - name: raftkv
+        type: file
+        allowUiUpdates: false
+        options:
+          path: /var/lib/grafana/dashboards
+          foldersFromFilesStructure: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: grafana}
+  template:
+    metadata:
+      labels: {app: grafana}
+    spec:
+      containers:
+        - name: grafana
+          image: grafana/grafana:11.2.0
+          env:
+            # Anonymous read-only access. This is a local demonstration cluster
+            # reached only through a port-forward; a real deployment puts an
+            # identity provider in front and does not ship credentials in a
+            # manifest.
+            - {name: GF_AUTH_ANONYMOUS_ENABLED, value: "true"}
+            - {name: GF_AUTH_ANONYMOUS_ORG_ROLE, value: Viewer}
+            - {name: GF_AUTH_BASIC_ENABLED, value: "false"}
+            - {name: GF_SECURITY_ALLOW_EMBEDDING, value: "true"}
+            - {name: GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH, value: /var/lib/grafana/dashboards/raftkv.json}
+          ports:
+            - {name: web, containerPort: 3000}
+          volumeMounts:
+            - {name: provisioning-datasources, mountPath: /etc/grafana/provisioning/datasources}
+            - {name: provisioning-dashboards, mountPath: /etc/grafana/provisioning/dashboards}
+            - {name: dashboards, mountPath: /var/lib/grafana/dashboards}
+          readinessProbe:
+            httpGet: {path: /api/health, port: web}
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {memory: 512Mi}
+      volumes:
+        - name: provisioning-datasources
+          configMap:
+            name: grafana-provisioning
+            items: [{key: datasources.yaml, path: datasources.yaml}]
+        - name: provisioning-dashboards
+          configMap:
+            name: grafana-provisioning
+            items: [{key: dashboards.yaml, path: dashboards.yaml}]
+        # Created from deploy/monitoring/dashboards/ by the install script, so
+        # the dashboard stays a reviewable JSON file rather than a string
+        # embedded in a manifest.
+        - name: dashboards
+          configMap: {name: grafana-dashboards}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: monitoring
+spec:
+  selector: {app: grafana}
+  ports:
+    - {name: web, port: 3000, targetPort: web}

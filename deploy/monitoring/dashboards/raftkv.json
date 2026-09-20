@@ -1,0 +1,266 @@
+{
+  "title": "Raft KV cluster",
+  "uid": "raftkv-cluster",
+  "tags": ["raftkv", "raft", "consensus"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": { "text": "Prometheus", "value": "Prometheus" },
+        "hide": 0
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Can the cluster commit?",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "title": "Leader",
+      "description": "Which node is leading. 'no leader' means writes and linearizable reads are both refused. A brief gap during an election is normal; a sustained one is the RaftKVNoLeader alert.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 5, "w": 5, "x": 0, "y": 1 },
+      "targets": [
+        {
+          "expr": "max(raftkv_raft_is_leader == 1) by (node)",
+          "legendFormat": "node {{node}}",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "name",
+        "colorMode": "background",
+        "graphMode": "none"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no leader",
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Nodes up / quorum",
+      "description": "Reachable nodes against the majority the current configuration requires. The voter count is read from the cluster, so it stays correct across membership changes.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 5, "w": 5, "x": 5, "y": 1 },
+      "targets": [
+        { "expr": "count(raftkv_up == 1)", "legendFormat": "up", "refId": "A" },
+        { "expr": "floor(max(raftkv_cluster_voters) / 2) + 1", "legendFormat": "quorum", "refId": "B" }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 3 }]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Term",
+      "description": "Raft's logical clock. It only ever increases, and it increases once per election attempt, so a term climbing steadily means the cluster is failing to elect rather than serving.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 5, "w": 4, "x": 10, "y": 1 },
+      "targets": [{ "expr": "max(raftkv_raft_term)", "refId": "A" }],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "none",
+        "graphMode": "area"
+      },
+      "fieldConfig": { "defaults": { "unit": "none" }, "overrides": [] }
+    },
+    {
+      "type": "timeseries",
+      "title": "Nodes that can name a leader",
+      "description": "The gaps are elections. Their width is the unavailability window a client sees, which is why this is plotted rather than summarised: a counter of leader changes says an election happened, not how long it cost.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 5, "w": 10, "x": 14, "y": 1 },
+      "targets": [
+        { "expr": "sum(raftkv_raft_has_leader)", "legendFormat": "nodes with a leader", "refId": "A" },
+        { "expr": "floor(max(raftkv_cluster_voters) / 2) + 1", "legendFormat": "quorum", "refId": "B" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "custom": { "fillOpacity": 10, "lineWidth": 2, "showPoints": "never" }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "quorum" },
+            "properties": [
+              { "id": "custom.lineStyle", "value": { "dash": [10, 10], "fill": "dash" } },
+              { "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } },
+              { "id": "custom.fillOpacity", "value": 0 }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "type": "row",
+      "title": "Replication",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 6 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Commit throughput",
+      "description": "Entries committed per second. Every one was fsynced by a majority before being counted, so this is bounded by disk rather than CPU.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 7 },
+      "targets": [
+        { "expr": "rate(raftkv_raft_commit_index[1m]) > 0", "legendFormat": "{{pod}}", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": { "fillOpacity": 5, "lineWidth": 1, "showPoints": "never" }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Replication lag, per follower",
+      "description": "How many entries behind the leader each follower is. Only the leader reports this, because only the leader tracks per-peer progress; a follower emits no series rather than zero, since zero would read as 'caught up' instead of 'not the leader'.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 7 },
+      "targets": [
+        { "expr": "raftkv_raft_replication_lag", "legendFormat": "node {{node}} -> peer {{peer}}", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "min": 0,
+          "custom": { "fillOpacity": 0, "lineWidth": 2, "showPoints": "never" }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Commit index minus applied index",
+      "description": "Entries agreed but not yet visible to readers. A read waits for the state machine to reach the read index, so this is latency a client actually feels.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 7 },
+      "targets": [
+        {
+          "expr": "raftkv_raft_commit_index - raftkv_raft_applied_index",
+          "legendFormat": "{{pod}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "min": 0,
+          "custom": { "fillOpacity": 5, "lineWidth": 1, "showPoints": "never" }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "row",
+      "title": "Stability",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Elections and leadership changes",
+      "description": "An election that produced no leader is a failed campaign. Elections rising while leader changes stay flat means nodes are repeatedly campaigning without winning, which is what a partition looks like from inside.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 15 },
+      "targets": [
+        { "expr": "sum(increase(raftkv_raft_elections_total[5m]))", "legendFormat": "elections started", "refId": "A" },
+        { "expr": "sum(increase(raftkv_raft_leader_changes_total[5m]))", "legendFormat": "leadership changes", "refId": "B" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "custom": { "fillOpacity": 10, "lineWidth": 1, "showPoints": "never" }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "table",
+      "title": "What each node believes",
+      "description": "The same view kvctl status prints. Nodes disagreeing about the term or the leader is normal for a moment and a problem if it persists.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 15 },
+      "targets": [
+        { "expr": "raftkv_raft_term", "format": "table", "instant": true, "refId": "A" },
+        { "expr": "raftkv_raft_commit_index", "format": "table", "instant": true, "refId": "B" },
+        { "expr": "raftkv_raft_applied_index", "format": "table", "instant": true, "refId": "C" },
+        { "expr": "raftkv_raft_is_leader", "format": "table", "instant": true, "refId": "D" }
+      ],
+      "transformations": [
+        { "id": "merge", "options": {} },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true, "__name__": true, "job": true, "instance": true, "namespace": true, "container": true, "endpoint": true },
+            "renameByName": {
+              "pod": "Pod",
+              "node": "Node",
+              "Value #A": "Term",
+              "Value #B": "Commit",
+              "Value #C": "Applied",
+              "Value #D": "Leader"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Leader" },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  { "type": "value", "options": { "0": { "text": "follower", "color": "text", "index": 0 }, "1": { "text": "leader", "color": "green", "index": 1 } } }
+                ]
+              },
+              { "id": "custom.cellOptions", "value": { "type": "color-text" } }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

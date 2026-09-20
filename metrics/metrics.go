@@ -170,7 +170,16 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 
 	// Replication lag is only knowable at the leader. Followers report nothing
 	// rather than zero, because zero would look like "fully caught up".
+	//
+	// The leader tracks its own progress too, since its own log counts toward
+	// the majority that commits an entry. That entry is skipped here: a node's
+	// lag behind itself is zero by definition, and publishing it puts a line on
+	// the dashboard that looks like a perfectly healthy follower but is not a
+	// follower at all — the exact confusion the paragraph above avoids.
 	for peer, match := range status.Match {
+		if peer == status.ID {
+			continue
+		}
 		peerID := strconv.FormatUint(uint64(peer), 10)
 		lag := float64(0)
 		if status.CommitIndex > match {

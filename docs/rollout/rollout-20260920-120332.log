@@ -1,0 +1,23 @@
+rolling upgrade, 20260920-120332
+
+rollout took: 160s
+
+before (names are stable; the UID is what changes):
+kv-raftkv-0   ae1c18be-b384-4e47-8d09-d8e599b4b4c1   2026-09-20T11:39:03Z
+kv-raftkv-1   9fcce69f-1756-430c-8376-e98e03823443   2026-09-20T11:38:31Z
+kv-raftkv-2   a7a4eb5f-def6-4eae-8ed3-5d7dca3d7ce9   2026-09-20T11:58:38Z
+kv-raftkv-3   87b9ccbc-b63f-4a05-9238-5a59dbedc5b3   2026-09-20T11:58:38Z
+kv-raftkv-4   c3502eed-76fa-417b-a214-26cfb34ca2d0   2026-09-20T11:58:38Z
+
+after:
+kv-raftkv-0   a1ba5d63-82a8-4ace-86a1-12fb73d75be3   2026-09-20T12:03:01Z
+kv-raftkv-1   61b278c7-b881-466c-84c2-fca1a8d5b77e   2026-09-20T12:02:29Z
+kv-raftkv-2   ad31b5d8-7aa7-45a5-962d-8be86458e137   2026-09-20T12:01:57Z
+kv-raftkv-3   00187d67-6fdb-4a58-80bb-7a6bdabbbfa7   2026-09-20T12:01:25Z
+kv-raftkv-4   f4605d85-ff19-44df-967e-18a427ff40ae   2026-09-20T12:00:53Z
+
+--- workload ---
+driving 8 clients over 5 keys for 2m30s against [kv-raftkv-0.kv-raftkv-headless:8001 kv-raftkv-1.kv-raftkv-headless:8001 kv-raftkv-2.kv-raftkv-headless:8001 kv-raftkv-3.kv-raftkv-headless:8001 kv-raftkv-4.kv-raftkv-headless:8001]
+140071 operations over 2m30.003s (70048 get, 59459 put, 10564 delete) across 5 keys; 140055 completed, 16 outcome unknown
+checking linearizability (giving up after 2m0s)...
+linearizable — 140071 operations over 2m30.003s (70048 get, 59459 put, 10564 delete) across 5 keys; 140055 completed, 16 outcome unknown, checked in 342ms
