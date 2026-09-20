@@ -18,7 +18,7 @@ image:
   # Never a floating tag: the version running has to be knowable from this file
   # alone, and revertible by reverting the commit that changed it.
   repository: ghcr.io/sachin-680/raftkv
-  tag: "sha-37f3e23b8b90"
+  tag: "sha-462baa334b8e"
   pullPolicy: IfNotPresent
 
 raft:
