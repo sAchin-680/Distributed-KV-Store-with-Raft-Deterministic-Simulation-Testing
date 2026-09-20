@@ -63,7 +63,22 @@ It waits 15 seconds, not zero. A leaderless instant is *normal* — every electi
 
 **`RaftKVBelowQuorum`** reads the voter count from the cluster rather than hardcoding five, so it stays correct across membership changes.
 
-**`RaftKVLeaderFlapping` uses `max`, not `sum`, and that was a bug before it was a decision.** Every node observes the same sequence of leadership changes, so the per-node counters are N redundant views of one sequence rather than N independent events. Summing them multiplies each change by however many nodes saw it: on a five-node cluster a *single* leadership change scores 5 and trips a threshold of 4. It also makes the value depend on cluster size and on how many pods happen to be reporting, so identical behaviour alerts differently after a scale-up. This fired spuriously for exactly that reason until the aggregator was corrected.
+**`RaftKVLeaderFlapping` took two corrections, and both were bugs before they were decisions.**
+
+First the aggregator. Every node observes the same sequence of leadership changes, so the per-node counters are N redundant views of one sequence rather than N independent events. Summing them multiplied each change by however many nodes saw it — on five nodes a *single* leadership change scored 5 and tripped a threshold of 4. It also made the value depend on how many pods happened to be reporting, so identical behaviour alerted differently after a scale-up. That is why it fired spuriously. Now `max`.
+
+Then the threshold, which is now the cluster's own size rather than a constant. That is derived, not chosen: a rolling upgrade replaces every pod one at a time, and each replacement costs **at most one** leadership change, because only the pod that currently leads causes an election. A full rollout of an N-node cluster therefore cannot exceed N changes, and any fixed number below N fires on a routine upgrade.
+
+Measured against a real five-node rollout, sampling every 15 seconds:
+
+```
+  21:52:08  ready=5/5  prod=0.0
+  21:52:23  ready=4/5  prod=0.0      one pod down at a time, never below quorum
+  21:53:23  ready=4/5  prod=1.1
+  21:54:54  ready=5/5  prod=1.0      all five replaced
+```
+
+**One leadership change for a complete five-node rollout.** The bound is 5, the observed cost is 1, and the old constant of 4 sat between them — it would not have fired on this rollout and would have fired on an unlucky one. Reading the rule aloud now: *more leadership changes in ten minutes than there are nodes to be leader.* That is not an upgrade; it is a cluster that cannot keep one.
 
 **`RaftKVNodeDown` is a warning, not a page.** One node down on a five-node cluster is survivable by construction. It becomes urgent only when a second follows, and that is what the quorum alert is for.
 

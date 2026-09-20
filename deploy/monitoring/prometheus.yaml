@@ -168,23 +168,37 @@ data:
           # max, not sum. Every node observes the same sequence of leadership
           # changes, so the per-node counters are N redundant views of one
           # sequence rather than N independent events. Summing them multiplies
-          # each change by however many nodes happened to see it: on a
-          # five-node cluster a *single* leadership change scores 5 and trips a
-          # threshold of 4. It also makes the value depend on the cluster size
-          # and on how many pods are currently reporting, so the same behaviour
-          # alerts differently after a scale-up. This fired spuriously before
-          # the aggregator was corrected.
+          # each change by however many nodes saw it: on a five-node cluster a
+          # *single* leadership change scores 5. It also makes the value depend
+          # on how many pods happen to be reporting, so identical behaviour
+          # alerts differently after a scale-up.
+          #
+          # The threshold is the cluster's own size rather than a constant, and
+          # that is derived rather than chosen. A rolling upgrade replaces every
+          # pod one at a time, and each replacement costs at most one leadership
+          # change — only the pod that currently leads causes an election. So a
+          # full rollout of an N-node cluster cannot exceed N changes, and any
+          # fixed number below N fires on a routine upgrade. A measured
+          # five-node rollout here cost 1; the bound is 5, and a constant of 4
+          # would have fired on an unlucky one.
+          #
+          # Reading it aloud: more leadership changes in ten minutes than there
+          # are nodes to be leader. That is not an upgrade, it is a cluster that
+          # cannot keep one.
           - alert: RaftKVLeaderFlapping
-            expr: max by (namespace) (increase(raftkv_raft_leader_changes_total[10m])) > 4
+            expr: >-
+              max by (namespace) (increase(raftkv_raft_leader_changes_total[10m]))
+                > max by (namespace) (raftkv_cluster_voters)
             for: 0s
             labels:
               severity: warning
             annotations:
               summary: "{{ $labels.namespace }}: leadership changed {{ $value }} times in ten minutes"
               description: >-
-                Expected during a rolling upgrade, when every node is replaced
-                in turn. Outside one, look for a node that cannot answer
-                heartbeats within the election timeout.
+                More changes than the cluster has nodes, so this is not a
+                rolling upgrade. Look for a node that cannot answer heartbeats
+                within the election timeout — a slow disk, a saturated link, or
+                a neighbour starving it of CPU.
 
           # A follower falling behind does not stop the cluster, but it stops
           # counting toward quorum in practice: the leader cannot commit without
