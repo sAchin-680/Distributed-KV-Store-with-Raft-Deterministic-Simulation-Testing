@@ -28,3 +28,10 @@
 # Editor
 .idea/
 *.swp
+
+# Terraform keeps its own Helm repository cache, isolated from the operator's.
+terraform/**/.helm/
+.terraform/
+*.tfstate
+*.tfstate.backup
+.terraform.lock.hcl
