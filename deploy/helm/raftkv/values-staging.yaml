@@ -1,0 +1,46 @@
+# Staging.
+#
+# Deliberately not a smaller copy of production. The point of staging is to
+# catch what differs between a laptop and a cluster — DNS, scheduling, real
+# fsync, a rolling upgrade — so the things that would change the *behaviour*
+# being tested are kept identical, and only cost is reduced.
+#
+# Three nodes rather than five is the one real difference, and it is a
+# deliberate one: three tolerates a single failure, which is enough to exercise
+# every code path that matters (election, catch-up, a rolling upgrade holding
+# quorum) at 60% of the cost. What it does not exercise is the two-failure case,
+# which is why production runs five.
+
+replicaCount: 3
+
+image:
+  # Written by the deployment pipeline, tagged with the commit that produced it.
+  # Never a floating tag: the version running has to be knowable from this file
+  # alone, and revertible by reverting the commit that changed it.
+  repository: ghcr.io/sachin-680/raftkv
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+raft:
+  tick: 100ms
+  electionTicks: 10
+  heartbeatTicks: 2
+  preVote: true
+  # Louder than production, because this is where a failure is meant to be
+  # diagnosed rather than merely survived.
+  logLevel: debug
+
+persistence:
+  enabled: true
+  size: 2Gi
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 96Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+podDisruptionBudget:
+  enabled: true

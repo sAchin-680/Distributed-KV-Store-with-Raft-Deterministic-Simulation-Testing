@@ -1,0 +1,47 @@
+# Production.
+#
+# Five nodes, because five tolerates two simultaneous failures and three
+# tolerates one. That difference is not academic on a cluster that gets rolled:
+# during an upgrade one node is already down by design, so a three-node cluster
+# is running with no margin at all for the duration, and a single unlucky
+# failure takes it below quorum. Five leaves one spare failure throughout.
+#
+# Never an even number. Four nodes tolerate exactly one failure, the same as
+# three, while needing one more vote to agree — strictly worse on both counts.
+
+replicaCount: 5
+
+image:
+  repository: ghcr.io/sachin-680/raftkv
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+raft:
+  tick: 100ms
+  electionTicks: 10
+  heartbeatTicks: 2
+  preVote: true
+  logLevel: info
+
+persistence:
+  enabled: true
+  size: 8Gi
+
+# Set from measurement rather than guesswork: an fsync costs about 8ms and
+# dominates everything the algorithm does, so these nodes are disk-bound rather
+# than CPU-bound. The request is small because the CPU genuinely is idle; the
+# limit exists to stop one node starving its neighbours, not to describe
+# expected use.
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+
+podDisruptionBudget:
+  enabled: true
+
+# Spread across machines, so losing one host cannot take a majority with it.
+antiAffinity: soft

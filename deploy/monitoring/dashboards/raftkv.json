@@ -200,12 +200,12 @@
     {
       "type": "timeseries",
       "title": "Elections and leadership changes",
-      "description": "An election that produced no leader is a failed campaign. Elections rising while leader changes stay flat means nodes are repeatedly campaigning without winning, which is what a partition looks like from inside.",
+      "description": "An election that produced no leader is a failed campaign. Elections rising while leader changes stay flat means nodes are repeatedly campaigning without winning, which is what a partition looks like from inside. Aggregated with max rather than sum: every node observes the same sequence, so summing would multiply each event by the number of nodes watching.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "gridPos": { "h": 7, "w": 12, "x": 0, "y": 15 },
       "targets": [
-        { "expr": "sum(increase(raftkv_raft_elections_total[5m]))", "legendFormat": "elections started", "refId": "A" },
-        { "expr": "sum(increase(raftkv_raft_leader_changes_total[5m]))", "legendFormat": "leadership changes", "refId": "B" }
+        { "expr": "max(increase(raftkv_raft_elections_total[5m]))", "legendFormat": "elections started", "refId": "A" },
+        { "expr": "max(increase(raftkv_raft_leader_changes_total[5m]))", "legendFormat": "leadership changes", "refId": "B" }
       ],
       "fieldConfig": {
         "defaults": {

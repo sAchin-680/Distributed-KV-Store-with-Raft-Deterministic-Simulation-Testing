@@ -1,13 +1,27 @@
 # GitOps
 
-ArgoCD follows `deploy/helm/raftkv` on `main`. Nothing in the cluster is applied by hand; the desired state is a commit.
+ArgoCD follows `deploy/helm/raftkv` on `main`, as two Applications — staging and production — reading the same chart with different value files. Nothing in the cluster is applied by hand; the desired state is a commit.
 
 ```bash
-make argocd-up      # install ArgoCD, hand the release over, create the Application
-make argocd-demo    # break the cluster by hand, watch it corrected
+make argocd-up      # install ArgoCD, create both Applications
+make argocd-status  # what each environment is running
+make argocd-demo    # break staging by hand, watch it corrected
 make argocd-open    # the UI, with the admin password
 make argocd-down
 ```
+
+## Two environments, one chart
+
+| | staging | production |
+| --- | --- | --- |
+| Nodes | 3 | 5 |
+| Namespace | `raftkv-staging` | `raftkv-production` |
+| Log level | debug | info |
+| Image tag | written by the pipeline | promoted from staging, behind an approval |
+
+Same chart deliberately. If staging rendered different manifests it would stop being a rehearsal, and the class of bug it exists to catch — the one that only appears on a real cluster — is exactly the class it would stop covering. What differs is the values, and the values are in git.
+
+Three nodes in staging is the one real difference, and a deliberate one: three tolerates a single failure, which exercises every path that matters — election, catch-up, a rolling upgrade holding quorum — at 60% of the cost. What it does not exercise is the two-failure case, which is why production runs five.
 
 ## It was broken on purpose
 
@@ -52,6 +66,16 @@ An Application with `selfHeal` is an agent holding write access to the cluster. 
 
 `image.tag: "0.1.0"`, not `latest`. A floating tag means the deployed version is whatever was last pushed to the registry — unknowable from the repository, and unrevertible by reverting a commit. Those two properties are the entire reason for this arrangement, and a floating tag quietly removes both.
 
-## What this does not do yet
+## Why production also syncs automatically
 
-Sync is automated from `main` with no staging gate, so a merge reaches this cluster directly. The continuous-deployment work adds the part that matters for a real system: an image built and tagged by commit SHA, staging synced automatically, and production behind a manual approval — all of it gated on the fuzz suite, so a commit that breaks consensus under simulated faults never reaches a cluster at all.
+The obvious arrangement would be to leave production un-automated, so a human clicks Sync. This does the opposite, and the reason is worth stating.
+
+A human clicking Sync means git no longer describes production: the commit is merged, the cluster is not running it, and the difference exists only in somebody's intent. Reverting the commit would then not roll production back — which removes the single property that makes any of this worth doing.
+
+So the approval gates the **commit** that changes the production image tag, not the sync. It lives on the `production` GitHub Environment in [the pipeline](../../.github/workflows/cd.yml). Once the tag is in git, git is true again, and a rollback is a revert.
+
+## Deleting these takes an order
+
+The `resources-finalizer` needs the `AppProject` to still exist in order to work out what it is allowed to delete. Handing both to a single `kubectl delete -f` takes the project first often enough that the Application wedges: the finalizer can never complete, the delete blocks until it times out, and the workloads it should have removed are orphaned in the cluster. Recovering means patching the finalizer off by hand.
+
+`argocd.sh down` deletes the Applications first, then the project, and clears the finalizer if one is stuck. This was found the direct way.

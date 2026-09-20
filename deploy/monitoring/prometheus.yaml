@@ -155,8 +155,18 @@ data:
           # symptom, usually of a node too slow to answer heartbeats in time or
           # a network dropping them, and each change costs a no-op commit and
           # every in-flight request on the old leader.
+          #
+          # max, not sum. Every node observes the same sequence of leadership
+          # changes, so the per-node counters are N redundant views of one
+          # sequence rather than N independent events. Summing them multiplies
+          # each change by however many nodes happened to see it: on a
+          # five-node cluster a *single* leadership change scores 5 and trips a
+          # threshold of 4. It also makes the value depend on the cluster size
+          # and on how many pods are currently reporting, so the same behaviour
+          # alerts differently after a scale-up. This fired spuriously before
+          # the aggregator was corrected.
           - alert: RaftKVLeaderFlapping
-            expr: sum(increase(raftkv_raft_leader_changes_total[10m])) > 4
+            expr: max(increase(raftkv_raft_leader_changes_total[10m])) > 4
             for: 0s
             labels:
               severity: warning
